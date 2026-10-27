@@ -26,6 +26,8 @@ log = logging.getLogger("miair")
 # 失败而「复用缓存 serviceToken」持续成功, 无节流会形成 重启→登录失败→复用→
 # 再重启 的死循环, 并以每秒数次频率请求小米接口 (2026-09-06 生产事故)。
 RECOVERY_RESTART_MIN_INTERVAL = 60
+# 音箱在线状态巡检间隔 (秒)
+SPEAKER_VISIBILITY_CHECK_SECONDS = 15
 
 
 class Orchestrator:
@@ -44,6 +46,11 @@ class Orchestrator:
         self.dlna_running = False
         self.airplay_manager: AirPlayManager | None = None
         self.spotify: SpotifyReceiver | None = None
+        self.spotify_target_offline = False
+        self.spotify_offline_reason = ""
+        self._spotify_watch_task: asyncio.Task | None = None
+        self._visibility_task: asyncio.Task | None = None
+        self._offline_speakers: set[str] = set()
         self._device_check_task: asyncio.Task | None = None
         # 重启串行化: 防止连续扫码/保存设置触发多个 restart 并发互相踩踏
         self._restart_lock = asyncio.Lock()
@@ -214,6 +221,9 @@ class Orchestrator:
 
             await self._start_spotify()
 
+            await self._refresh_speaker_visibility()
+            self._start_visibility_monitor()
+
             log.info(f"MiAir Next 服务启动完成! 共 {len(self.renderers)} 个音箱")
             log.info("手机 DLNA / AirPlay 现在应该能发现这些设备了")
 
@@ -246,8 +256,61 @@ class Orchestrator:
         except Exception as e:
             log.error(f"启动 AirPlay 服务失败: {e}")
 
+    def _resolve_spotify_controller(self):
+        """解析 Spotify 目标音箱控制器"""
+        controllers = self.speaker_manager.controllers if self.speaker_manager else {}
+        did = (getattr(self.config, "spotify_did", "") or "").strip()
+        if did:
+            return controllers.get(did)
+        return next(iter(controllers.values()), None)
+
+    async def _is_controller_online(self, controller) -> bool:
+        """检查目标音箱是否在线"""
+        try:
+            await asyncio.wait_for(controller.get_status(), timeout=10)
+            return True
+        except Exception as e:  # noqa: BLE001
+            if self.spotify_target_offline:
+                log.debug(f"Spotify 目标音箱仍离线: {e}")
+            else:
+                log.info(f"Spotify 目标音箱离线: {e}")
+            return False
+
+    def _mark_spotify_offline(self, reason: str) -> None:
+        """标记目标音箱离线并等待上线"""
+        self.spotify_target_offline = True
+        self.spotify_offline_reason = reason
+        log.warning(f"Spotify 暂不启动: {reason}; 等待目标音箱上线")
+        self._ensure_spotify_watch()
+
+    def _ensure_spotify_watch(self) -> None:
+        task = self._spotify_watch_task
+        if task is not None and not task.done():
+            return
+        self._spotify_watch_task = asyncio.create_task(self._watch_spotify_online())
+
+    async def _watch_spotify_online(self) -> None:
+        """监听目标音箱上线并在上线后启动 Spotify 接收器"""
+        try:
+            while True:
+                await asyncio.sleep(10)
+                if not getattr(self.config, "spotify_enabled", False):
+                    return
+                if self.spotify is not None:
+                    return
+                controller = self._resolve_spotify_controller()
+                if controller is None:
+                    continue
+                if not await self._is_controller_online(controller):
+                    continue
+                log.info("Spotify 目标音箱已上线, 启动接收器")
+                await self._start_spotify()
+                return
+        except asyncio.CancelledError:
+            pass
+
     async def _start_spotify(self):
-        """启动 Spotify Connect 接收器 (单设备, 绑定选定的音箱)"""
+        """启动 Spotify Connect 接收器"""
         await self._stop_spotify()
         if not getattr(self.config, "spotify_enabled", False):
             return
@@ -256,32 +319,51 @@ class Orchestrator:
             return
         controllers = self.speaker_manager.controllers if self.speaker_manager else {}
         if not controllers:
-            log.warning("没有可用的音箱, 无法启动 Spotify 接收器")
+            self._mark_spotify_offline("没有可用音箱")
             return
-        did = (self.config.spotify_did or "").strip()
-        controller = controllers.get(did) if did else None
+        controller = self._resolve_spotify_controller()
         if controller is None:
-            controller = next(iter(controllers.values()))
-            if did:
-                log.warning(
-                    f"Spotify 目标音箱 did={did} 不在线, 回退到 "
-                    f"{controller.speaker.get_dlna_name()}"
-                )
-        self.spotify = SpotifyReceiver(self.config, controller, self.config.hostname)
+            self._mark_spotify_offline("目标音箱未初始化或未配置")
+            return
+        if not await self._is_controller_online(controller):
+            self._mark_spotify_offline("目标音箱离线")
+            return
+        self.spotify_target_offline = False
+        self.spotify_offline_reason = ""
+        receiver = SpotifyReceiver(self.config, controller, self.config.hostname)
+        receiver.on_target_offline = lambda: self._on_spotify_target_offline(receiver)
+        self.spotify = receiver
         try:
             await self.spotify.start()
+            log.info(f"Spotify 接收器已绑定在线音箱: {controller.speaker.get_dlna_name()}")
         except Exception as e:  # noqa: BLE001
             # 保留实例供 Web 面板展示失败原因
             log.error(f"启动 Spotify 接收器失败: {e}")
 
+    async def _on_spotify_target_offline(self, receiver) -> None:
+        """目标音箱离线时停止接收器并监听上线"""
+        if self.spotify is not receiver:
+            return
+        log.warning("目标音箱离线, 停止 Spotify 接收器并从设备列表移除")
+        await self._stop_spotify()
+        self.spotify_target_offline = True
+        self.spotify_offline_reason = "目标音箱离线"
+        self._ensure_spotify_watch()
+
     async def _stop_spotify(self):
         """停止 Spotify 接收器 (幂等)"""
+        task = self._spotify_watch_task
+        self._spotify_watch_task = None
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
         if self.spotify is not None:
             try:
                 await self.spotify.stop()
             except Exception as e:  # noqa: BLE001
                 log.warning(f"停止 Spotify 接收器失败: {e}")
             self.spotify = None
+        self.spotify_target_offline = False
+        self.spotify_offline_reason = ""
 
     def get_spotify_receiver(self) -> SpotifyReceiver | None:
         return self.spotify
@@ -308,8 +390,82 @@ class Orchestrator:
             # _start_dlna_services 内部已重启 AirPlay (先停旧再启新), 无需再次重启
             await self._start_dlna_services()
 
+    def _start_visibility_monitor(self) -> None:
+        """启动音箱在线状态巡检任务"""
+        if not self.speaker_manager or not self.speaker_manager.controllers:
+            return
+        task = self._visibility_task
+        if task is not None and not task.done():
+            return
+        self._visibility_task = asyncio.create_task(self._monitor_speaker_visibility())
+
+    async def _monitor_speaker_visibility(self) -> None:
+        """周期巡检音箱在线状态"""
+        try:
+            while self.dlna_running:
+                await asyncio.sleep(SPEAKER_VISIBILITY_CHECK_SECONDS)
+                await self._refresh_speaker_visibility()
+        except asyncio.CancelledError:
+            pass
+
+    async def _refresh_speaker_visibility(self) -> None:
+        """巡检所有音箱在线状态并更新服务可见性"""
+        if not self.dlna_running or not self.speaker_manager:
+            return
+        for did, controller in list(self.speaker_manager.controllers.items()):
+            try:
+                await asyncio.wait_for(controller.get_status(), timeout=10)
+                online = True
+            except Exception as e:  # noqa: BLE001
+                log.debug(f"设备在线巡检失败 did={did}: {e}")
+                online = False
+            if online and did in self._offline_speakers:
+                await self._show_speaker_services(did, controller)
+                self._offline_speakers.discard(did)
+            elif not online and did not in self._offline_speakers:
+                await self._hide_speaker_services(did, controller)
+                self._offline_speakers.add(did)
+
+    async def _hide_speaker_services(self, did: str, controller) -> None:
+        """隐藏离线音箱的 AirPlay 与 DLNA 服务"""
+        name = controller.speaker.get_dlna_name()
+        udn = self._did_to_udn.get(did)
+        if self.airplay_manager:
+            await self.airplay_manager.hide_speaker(did)
+        if udn:
+            renderer = self.renderers.get(udn)
+            if renderer:
+                try:
+                    await renderer.reset_to_idle()
+                except Exception as e:  # noqa: BLE001
+                    log.warning(f"重置 DLNA 渲染器失败: {e}")
+            if self.ssdp_server:
+                await self.ssdp_server.unregister_renderer(udn)
+            if self.device_server:
+                await self.device_server.unregister_renderer(udn)
+        log.warning(f"设备离线, 已隐藏 AirPlay/DLNA: {name}")
+
+    async def _show_speaker_services(self, did: str, controller) -> None:
+        """恢复上线音箱的 AirPlay 与 DLNA 服务"""
+        name = controller.speaker.get_dlna_name()
+        udn = self._did_to_udn.get(did)
+        if udn:
+            renderer = self.renderers.get(udn)
+            if renderer and self.device_server:
+                self.device_server.register_renderer(renderer)
+            if self.ssdp_server:
+                self.ssdp_server.register_renderer(udn, name)
+                await self.ssdp_server.send_alive_for(udn)
+        if self.airplay_manager:
+            await self.airplay_manager.show_speaker(did, controller)
+        log.info(f"设备已上线, 恢复 AirPlay/DLNA: {name}")
+
     async def _stop_dlna_services(self):
         """停止 DLNA 服务"""
+        if self._visibility_task:
+            self._visibility_task.cancel()
+            self._visibility_task = None
+        self._offline_speakers.clear()
         if self.ssdp_server:
             await self.ssdp_server.stop()
             self.ssdp_server = None
