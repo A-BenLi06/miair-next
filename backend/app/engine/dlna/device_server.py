@@ -8,6 +8,7 @@ import secrets
 import shutil
 import tempfile
 import time
+from typing import TYPE_CHECKING
 
 import aiohttp
 from aiohttp import web
@@ -17,13 +18,13 @@ from app.engine.const import (
     TRANSPORT_STATE_PLAYING,
     TRANSPORT_STATE_STOPPED,
     TRANSPORT_STATE_TRANSITIONING,
+    UPNP_ERROR_ACTION_FAILED,
 )
 from app.engine.dlna.eventing import EventManager, build_last_change_event, clamp_timeout
 from app.engine.dlna.duration import probe_duration as probe_audio_duration
 from app.engine.dlna.media_buffer import MediaBuffer
 from app.engine.dlna.cover import (
     default_cover_asset_path,
-    resolve_default_cover_url,
 )
 from app.engine.dlna.renderer import DLNARenderer
 from app.engine.dlna.soap_handler import (
@@ -36,15 +37,26 @@ from app.engine.dlna.templates import (
     CONNECTION_MANAGER_SCPD,
     RENDERING_CONTROL_SCPD,
     device_description_xml,
+    soap_fault,
 )
 
 log = logging.getLogger("miair")
+
+if TYPE_CHECKING:
+    # 仅供类型标注使用 (运行时不导入, 避免 engine.config <-> dlna 循环依赖)
+    from app.engine.config import Config
 
 # 最多同时保留的音频缓冲数（含 seek 缓冲）
 _MAX_BUFFERS = 10
 
 # 时长嗅探: 等待缓冲就绪的最少数据量 (容器头部探测足够)
 _PROBE_MIN_BYTES = 64 * 1024
+
+# 音箱状态轮询周期 (秒)。提为模块常量以便回归测试压缩等待时间。
+_POLL_INTERVAL_SECONDS = 5.0
+
+# 缓冲清理周期 (秒)
+_BUFFER_CLEANUP_INTERVAL_SECONDS = 60.0
 
 
 class DeviceServer:
@@ -60,10 +72,12 @@ class DeviceServer:
         self._runner = None
         self._poll_task: asyncio.Task | None = None
         # 音频缓冲系统
+        # 并发模型: 这三个字典由事件循环单线程访问, 读写在无 await 的同步段内
+        # 完成即可保证原子性 (无需额外锁)。迭代它们时必须先取快照, 否则
+        # await 期间被回收/注销会导致 RuntimeError。
         self._media_buffers: dict[str, MediaBuffer] = {}  # buffer_id -> MediaBuffer
         self._proxy_tokens: dict[str, tuple[str, int, str]] = {}  # token -> (buffer_id, start_byte, udn)
         self._url_to_buffer: dict[str, str] = {}  # remote_url -> buffer_id (最新的)
-        self._buffers_lock = asyncio.Lock()  # 保护上述三个字典的并发访问
         self._proxy_session: aiohttp.ClientSession | None = None
         self._ffmpeg_path: str | None = None
         self._ffmpeg_checked: bool = False
@@ -231,7 +245,7 @@ class DeviceServer:
         
         # 如果找不到缓冲，尝试创建新缓冲
         if not buffer_id:
-            log.info(f"Seek: 未找到缓冲，尝试创建新缓冲...")
+            log.info("Seek: 未找到缓冲，尝试创建新缓冲...")
             self._cleanup_old_buffers()
             buffer_id = secrets.token_urlsafe(16)
             buf = MediaBuffer(original_url)
@@ -239,15 +253,15 @@ class DeviceServer:
             self._url_to_buffer[original_url] = buffer_id
             # 启动下载
             asyncio.get_running_loop().create_task(buf.start_download(self._get_proxy_session()))
-            log.info(f"Seek: 已启动新缓冲下载")
+            log.info("Seek: 已启动新缓冲下载")
         else:
             buf = self._media_buffers.get(buffer_id)
         
         if not buf or buf.error:
-            log.warning(f"Seek: 缓冲无效或出错")
+            log.warning("Seek: 缓冲无效或出错")
             return None
         if buf.total_size <= 0:
-            log.warning(f"Seek: 缓冲大小为0")
+            log.warning("Seek: 缓冲大小为0")
             return None
         if seek_seconds < 0:
             log.warning(f"Seek: 无效的时间参数 {seek_seconds}/{duration}")
@@ -255,11 +269,11 @@ class DeviceServer:
 
         # 等待缓冲完成（最多等待15秒）
         if not buf.download_complete:
-            log.info(f"Seek: 等待缓冲完成...")
+            log.info("Seek: 等待缓冲完成...")
             try:
                 await asyncio.wait_for(buf._complete_event.wait(), timeout=15.0)
             except asyncio.TimeoutError:
-                log.warning(f"Seek: 缓冲等待超时，尝试使用当前可用数据")
+                log.warning("Seek: 缓冲等待超时，尝试使用当前可用数据")
                 # 如果缓冲未完成但有足够数据（至少2MB），继续处理
                 if len(buf.data) < 2 * 1024 * 1024:
                     log.warning(f"Seek: 缓冲数据不足 ({len(buf.data)} bytes)")
@@ -438,7 +452,7 @@ class DeviceServer:
                 except (asyncio.TimeoutError, Exception):
                     log.warning("ffmpeg seek 进程杀死后等待超时")
             return None
-        except Exception as e:
+        except Exception:
             return None
         finally:
             # 确保进程已终止
@@ -674,24 +688,30 @@ class DeviceServer:
         self._buffer_last_accessed.clear()
 
     async def _periodic_buffer_cleanup(self):
-        """周期性清理已完成且长时间未访问的缓冲"""
+        """周期性清理已完成且长时间未访问的缓冲
+
+        并发安全: 清理期间有 await (虽然主要在事后), 且 renderers /
+        _media_buffers 会被 HTTP 请求与 unregister_renderer 并发修改,
+        故迭代前统一取快照, 避免字典变动中断清理任务。
+        """
         try:
             while True:
-                await asyncio.sleep(60)  # 每 1 分钟检查一次
+                await asyncio.sleep(_BUFFER_CLEANUP_INTERVAL_SECONDS)
                 now = time.time()
-                
+
                 # 收集当前正在播放的 URL 集合（包括 next_uri）
                 active_urls = set()
-                for renderer in self.renderers.values():
+                for renderer in list(self.renderers.values()):
                     if renderer.current_uri:
                         active_urls.add(renderer.current_uri)
                     if renderer.next_uri:
                         active_urls.add(renderer.next_uri)
-                
+
                 # 清理过时缓冲（创建超过 120 秒且已完成下载的）
                 to_remove = []
-                for bid, buf in self._media_buffers.items():
-                    if not buf.download_complete:
+                for bid in list(self._media_buffers):
+                    buf = self._media_buffers.get(bid)
+                    if buf is None or not buf.download_complete:
                         continue
                     # 跳过最近 120 秒内被代理访问过的缓冲（正在被流式传输）
                     last_access = self._buffer_last_accessed.get(bid, 0)
@@ -732,7 +752,10 @@ class DeviceServer:
                 # 清理已完成的 background tasks
                 self._background_tasks = {t for t in self._background_tasks if not t.done()}
         except asyncio.CancelledError:
-            pass
+            raise
+        except Exception as e:  # noqa: BLE001
+            # 清理任务异常不得静默终止 (否则缓冲只增不减, 最终撑爆内存上限)
+            log.error(f"缓冲清理任务异常退出: {e}", exc_info=True)
 
     def abort_proxy_for_renderer(self, udn: str):
         """立即中止指定渲染器的所有活跃代理连接，并屏蔽后续重连请求"""
@@ -790,10 +813,18 @@ class DeviceServer:
         # 注册任务到 udn 追踪列表
         if udn:
             current_task = asyncio.current_task()
-            if udn not in self._active_proxy_tasks:
-                self._active_proxy_tasks[udn] = set()
-            self._active_proxy_tasks[udn].add(current_task)
-            current_task.add_done_callback(lambda t: self._active_proxy_tasks[udn].discard(t))
+            # 闭包捕获 set 本身而非按 udn 回查: 设备注销后 key 可能已被移除,
+            # 回查会 KeyError; 同时在集合空时删掉 key, 避免每台播放过的音箱
+            # 永久留下一个空 set (原实现只 discard 不删 key, 属缓慢泄漏)。
+            tasks = self._active_proxy_tasks.setdefault(udn, set())
+            tasks.add(current_task)
+
+            def _untrack(t, _udn=udn, _tasks=tasks):
+                _tasks.discard(t)
+                if not _tasks and self._active_proxy_tasks.get(_udn) is _tasks:
+                    self._active_proxy_tasks.pop(_udn, None)
+
+            current_task.add_done_callback(_untrack)
 
         log.info(
             f"代理请求: base_offset={base_offset}, "
@@ -817,7 +848,7 @@ class DeviceServer:
                 return web.Response(status=502, text="Buffer Error")
             ok = await self._convert_buffer_to_wav(buf)
             if not ok:
-                log.warning(f"WAV 转码失败，尝试原始格式提供服务")
+                log.warning("WAV 转码失败，尝试原始格式提供服务")
         if buf.error or not buf.download_complete:
             log.error(f"音频缓冲未就绪: {buf.error}")
             return web.Response(status=502, text="Buffer Error")
@@ -1053,42 +1084,6 @@ class DeviceServer:
             # 对于未知格式，尝试使用原始数据
             return "data"
     
-    async def _handle_proxy_without_conversion(
-        self, request: web.Request, buf: MediaBuffer
-    ) -> web.StreamResponse:
-        """不使用转换的代理处理（回退方案）"""
-        # 等待下载完成
-        await buf.wait_for_completion(timeout=120)
-        if buf.error or not buf.download_complete:
-            return web.Response(status=502, text="Buffer Error")
-        
-        data = buf.data
-        content_type = buf.content_type
-        content_length = len(data)
-        
-        resp_headers = {
-            "Content-Type": content_type,
-            "Content-Length": str(content_length),
-            "Accept-Ranges": "bytes",
-        }
-        response = web.StreamResponse(status=200, headers=resp_headers)
-        
-        await response.prepare(request)
-        pos = 0
-        try:
-            while pos < content_length:
-                chunk_end = min(pos + 65536, content_length)
-                chunk = bytes(data[pos:chunk_end])
-                await response.write(chunk)
-                pos = chunk_end
-            await response.write_eof()
-        except (ConnectionError, ConnectionResetError, BrokenPipeError):
-            log.info(f"代理连接中断(无转换): 客户端断开 ({pos}/{content_length} bytes)")
-        except Exception as e:
-            if "Cannot write to closing transport" not in str(e):
-                log.warning(f"代理响应失败(无转换): {e}")
-        return response
-
     @staticmethod
     def _parse_range_header(
         header: str, total: int
@@ -1166,10 +1161,19 @@ class DeviceServer:
         body = await request.text()
         params = parse_soap_body(body)
 
-        # 处理请求
-        response_xml, status_code = await handle_soap_request(
-            renderer, service_urn, action, params
-        )
+        # 处理请求 (handle_soap_request 内部已把参数错误/执行异常转成规范 Fault;
+        # 这里再兜一层, 确保任何意外都不会变成 HTTP 500 空响应)
+        try:
+            response_xml, status_code = await handle_soap_request(
+                renderer, service_urn, action, params
+            )
+        except Exception as e:  # noqa: BLE001
+            log.error(
+                f"[{renderer.friendly_name}] SOAP 请求处理异常 ({action}): {e}",
+                exc_info=True,
+            )
+            response_xml = soap_fault(UPNP_ERROR_ACTION_FAILED, "Internal error")
+            status_code = 500
 
         return web.Response(
             text=response_xml,
@@ -1253,7 +1257,7 @@ class DeviceServer:
         )
         try:
             await em._send_notify(sub, event_xml)
-        except Exception as e:
+        except Exception:
             pass
 
     async def _handle_unsubscribe(self, request: web.Request) -> web.Response:
@@ -1279,61 +1283,90 @@ class DeviceServer:
         return 1800
 
     async def _poll_speaker_states(self):
-        """定期轮询音箱实际播放状态，同步渲染器状态并发送事件通知"""
+        """定期轮询音箱实际播放状态，同步渲染器状态并发送事件通知
+
+        并发安全: 循环体每轮都要 await 云端查状态 (单台最多 10s), 期间
+        Orchestrator 的在线巡检可能调用 unregister_renderer() 从
+        self.renderers 里 pop 掉离线音箱。若直接迭代 self.renderers.items(),
+        字典在迭代中被修改会抛 RuntimeError 并直接杀死本任务 —— 而
+        stop() 与 Orchestrator._stop_dlna_services 都未兜住该异常, 后果是
+        停止链路中断: SSDP 已停、device_server 仍在监听、dlna_running 仍为
+        True, 之后每次「热重启」都撞同一具死任务, 只能重启进程才能恢复。
+        故每轮先对键取快照, 再按键取当前渲染器 (已注销的键自然跳过)。
+        """
         try:
             while True:
-                await asyncio.sleep(5)
-                for udn, renderer in self.renderers.items():
-                    if not renderer.speaker:
-                        continue
-
-                    # 检测控制端断开：渲染器处于终端状态（PAUSED/STOPPED）且有媒体URI
-                    # 1. PAUSED 振荡：音箱 STOP 但被强制保持 PAUSED 超过 30 秒
-                    #    语音打断场景（_user_stopped=False）：直接重置
-                    #    用户手动暂停（_user_stopped=True）：需确认无订阅者后重置
-                    # 2. STOPPED 持久：有 URI 但无控制活动超过 60 秒且无订阅者
-                    idle = False
-                    if (
-                        renderer.current_uri
-                        and renderer.transport_state == TRANSPORT_STATE_PAUSED
-                        and renderer._stuck_paused_since > 0
-                        and (time.time() - renderer._stuck_paused_since) > 30
-                    ):
-                        if not renderer._user_stopped:
-                            idle = True
-                        elif (
-                            renderer.event_manager
-                            and not renderer.event_manager.has_subscribers()
-                        ):
-                            idle = True
-                    elif (
-                        renderer.current_uri
-                        and renderer.transport_state == TRANSPORT_STATE_STOPPED
-                        and renderer._last_control_time > 0
-                        and (time.time() - renderer._last_control_time) > 60
-                        and renderer.event_manager
-                        and not renderer.event_manager.has_subscribers()
-                    ):
-                        idle = True
-
-                    if idle:
-                        await renderer.reset_to_idle()
-                        renderer._stuck_paused_since = 0.0
-                        continue
-
-                    if not renderer.current_uri:
-                        continue
-                    try:
-                        status = await asyncio.wait_for(
-                            renderer.speaker.get_status(), timeout=10
-                        )
-                        await self._sync_renderer_state(udn, renderer, status)
-                    except Exception as e:
-                        log.warning(
-                            f"[{renderer.friendly_name}] 轮询状态暂时失败 (网络或 API 超时): {e}"
-                        )
+                await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+                try:
+                    await self._poll_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    # 巡检是状态同步的唯一来源, 单轮失败必须只丢掉这一轮,
+                    # 不能让任务退出 (退出后 DLNA 状态永不更新且无法自愈)
+                    log.warning(f"本轮音箱状态轮询失败, 跳过本轮: {e}", exc_info=True)
         except asyncio.CancelledError:
-            pass
+            raise
+
+    async def _poll_once(self) -> None:
+        """执行一轮音箱状态巡检 (单台/单步失败不外溢)"""
+        for udn in list(self.renderers):
+            # 快照之后该设备可能已被注销 (离线隐藏), 跳过即可
+            renderer = self.renderers.get(udn)
+            if renderer is None or not renderer.speaker:
+                continue
+
+            # 检测控制端断开：渲染器处于终端状态（PAUSED/STOPPED）且有媒体URI
+            # 1. PAUSED 振荡：音箱 STOP 但被强制保持 PAUSED 超过 30 秒
+            #    语音打断场景（_user_stopped=False）：直接重置
+            #    用户手动暂停（_user_stopped=True）：需确认无订阅者后重置
+            # 2. STOPPED 持久：有 URI 但无控制活动超过 60 秒且无订阅者
+            idle = False
+            if (
+                renderer.current_uri
+                and renderer.transport_state == TRANSPORT_STATE_PAUSED
+                and renderer._stuck_paused_since > 0
+                and (time.time() - renderer._stuck_paused_since) > 30
+            ):
+                if not renderer._user_stopped:
+                    idle = True
+                elif (
+                    renderer.event_manager
+                    and not renderer.event_manager.has_subscribers()
+                ):
+                    idle = True
+            elif (
+                renderer.current_uri
+                and renderer.transport_state == TRANSPORT_STATE_STOPPED
+                and renderer._last_control_time > 0
+                and (time.time() - renderer._last_control_time) > 60
+                and renderer.event_manager
+                and not renderer.event_manager.has_subscribers()
+            ):
+                idle = True
+
+            if idle:
+                # 单台重置失败不应拖垮整轮巡检 (reset 内部有锁与通知)
+                try:
+                    await renderer.reset_to_idle()
+                except Exception as e:  # noqa: BLE001
+                    log.warning(
+                        f"[{renderer.friendly_name}] 重置为空闲失败: {e}"
+                    )
+                renderer._stuck_paused_since = 0.0
+                continue
+
+            if not renderer.current_uri:
+                continue
+            try:
+                status = await asyncio.wait_for(
+                    renderer.speaker.get_status(), timeout=10
+                )
+                await self._sync_renderer_state(udn, renderer, status)
+            except Exception as e:
+                log.warning(
+                    f"[{renderer.friendly_name}] 轮询状态暂时失败 (网络或 API 超时): {e}"
+                )
 
     async def _sync_renderer_state(
         self, udn: str, renderer: DLNARenderer, status: dict
@@ -1476,7 +1509,12 @@ class DeviceServer:
         self._buffer_cleanup_task = asyncio.create_task(self._periodic_buffer_cleanup())
 
     async def stop(self):
-        """停止 HTTP 服务"""
+        """停止 HTTP 服务
+
+        每一步独立兜底: 任何一步失败都不能中断后续清理, 否则会留下
+        "SSDP 已停但 HTTP 仍在监听 / 会话未关闭" 的半死状态。
+        尤其是轮询任务的 await —— 历史缺陷下它会带着 RuntimeError 抛出。
+        """
         # 停止轮询
         if self._poll_task:
             self._poll_task.cancel()
@@ -1484,6 +1522,9 @@ class DeviceServer:
                 await self._poll_task
             except asyncio.CancelledError:
                 pass
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"停止状态轮询任务时异常: {e}")
+            self._poll_task = None
 
         # 停止周期性缓冲清理
         if self._buffer_cleanup_task:
@@ -1492,6 +1533,9 @@ class DeviceServer:
                 await self._buffer_cleanup_task
             except asyncio.CancelledError:
                 pass
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"停止缓冲清理任务时异常: {e}")
+            self._buffer_cleanup_task = None
 
         # 取消所有 background tasks
         for task in list(self._background_tasks):
@@ -1512,8 +1556,11 @@ class DeviceServer:
                 log.warning("恢复任务取消超时")
             self._resume_tasks.clear()
 
-        for em in self.event_managers.values():
-            await em.stop()
+        for em in list(self.event_managers.values()):
+            try:
+                await em.stop()
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"停止 DLNA EventManager 失败: {e}")
         self._cleanup_all_buffers()
         if self._proxy_session and not self._proxy_session.closed:
             await self._proxy_session.close()

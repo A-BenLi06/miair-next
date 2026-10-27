@@ -130,7 +130,7 @@ class RTP_REALTIME(RTP):
                         self.payload = data[12 + (i * 4) + 1:-24]
                         break
                     i += 1
-            except IndexError as e:
+            except IndexError:
                 # pkt was probably not one with redundancy. Corrupt?
                 pass
 
@@ -887,7 +887,7 @@ class AudioBuffered(Audio):
                             serverconn.send(message)
                             playing = False
 
-                except (OSError, EOFError, BrokenPipeError) as e:
+                except (OSError, EOFError, BrokenPipeError):
                     pass
                 except (IndexError, ValueError):
                     pass  # unrecognized message passed

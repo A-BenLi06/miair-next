@@ -1114,7 +1114,7 @@ class modifiedMD5():
                 block_words[(A & (15 << 12)) >> 12], block_words[(B & (15 << 12)) >> 12] = block_words[(B & (15 << 12)) >> 12], block_words[(A & (15 << 12)) >> 12]
                 blockIn = bytearray(array.array('I', block_words.tobytes()))
 
-        print(f"%08X %08X %08X %08X" % (A, B, C, D))
+        print("%08X %08X %08X %08X" % (A, B, C, D))
         print("Out:")
         print("%08x + %08x = %08x" % (key_words[0], A & 0xffffffff, key_words[0] + A & 0xffffffff))
         print("%08x + %08x = %08x" % (key_words[1], B & 0xffffffff, key_words[1] + B & 0xffffffff))

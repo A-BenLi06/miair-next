@@ -374,7 +374,10 @@ class Orchestrator:
             await self._stop_dlna_services()
             # 先停掉旧的 AirPlay, 避免重启失败时旧实例带着过期音箱残留
             if self.airplay_manager:
-                await self.airplay_manager.stop()
+                try:
+                    await self.airplay_manager.stop()
+                except Exception as e:  # noqa: BLE001
+                    log.warning(f"停止旧 AirPlay 服务失败: {e}")
                 self.airplay_manager = None
             # 停止 Spotify 接收器，避免引用已失效的认证实例
             await self._stop_spotify()
@@ -383,12 +386,21 @@ class Orchestrator:
             if self.speaker_manager:
                 self.speaker_manager.controllers.clear()
             # 关闭并重新初始化 auth, 确保账号切换生效
-            await self.auth.close()
+            try:
+                await self.auth.close()
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"关闭旧 AuthManager 失败: {e}")
             self.auth = AuthManager(self.config)
             self.auth.on_credentials_recovered = self._on_auth_recovered
             self.speaker_manager = SpeakerManager(self.config, self.auth)
             # _start_dlna_services 内部已重启 AirPlay (先停旧再启新), 无需再次重启
-            await self._start_dlna_services()
+            # _start_dlna_services 自带 try/except 并复位 dlna_running;
+            # 这里再兜一层, 避免重启失败把异常抛给 BackgroundTasks 而静默丢失。
+            try:
+                await self._start_dlna_services()
+            except Exception as e:  # noqa: BLE001
+                log.error(f"重启 DLNA 服务失败: {e}", exc_info=True)
+                self.dlna_running = False
 
     def _start_visibility_monitor(self) -> None:
         """启动音箱在线状态巡检任务"""
@@ -461,16 +473,28 @@ class Orchestrator:
         log.info(f"设备已上线, 恢复 AirPlay/DLNA: {name}")
 
     async def _stop_dlna_services(self):
-        """停止 DLNA 服务"""
+        """停止 DLNA 服务
+
+        每一步独立兜底: 该方法是热重启链路的入口, 任一步异常上抛都会让
+        restart_dlna_services 整体中断, 并留下 dlna_running 与真实状态不一致
+        的半死状态 (SSDP 已停、HTTP 仍在监听), 后续每次保存配置都重复失败。
+        故各步失败只记警告, 最终一定复位状态标志。
+        """
         if self._visibility_task:
             self._visibility_task.cancel()
             self._visibility_task = None
         self._offline_speakers.clear()
         if self.ssdp_server:
-            await self.ssdp_server.stop()
+            try:
+                await self.ssdp_server.stop()
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"停止 SSDP 服务失败: {e}")
             self.ssdp_server = None
         if self.device_server:
-            await self.device_server.stop()
+            try:
+                await self.device_server.stop()
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"停止 DLNA HTTP 服务失败: {e}")
             self.device_server = None
         self.renderers.clear()
         self._did_to_udn.clear()

@@ -2,6 +2,7 @@
 
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import datetime
 
 from app.core.config import get_settings
@@ -12,10 +13,22 @@ _lock = threading.Lock()
 LOGIN_LOG_MAX_ROWS = 100
 
 
-def _connect() -> sqlite3.Connection:
+@contextmanager
+def _connect():
+    """打开连接并在退出时显式关闭
+
+    注意 sqlite3.Connection 的 `with` 只提交/回滚事务, **不会关闭连接**。
+    原实现 `with _lock, _connect() as conn:` 依赖 CPython 引用计数即时回收
+    fd, 一旦 GC 延迟就会线性泄漏 (实测关闭 GC 后 500 次查询泄漏 500 个 fd)。
+    故此处包一层: 内层 `with conn` 保留事务语义, 外层 finally 保证 close。
+    """
     conn = sqlite3.connect(get_settings().db_path)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def init_db():

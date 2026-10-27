@@ -293,7 +293,6 @@ class SpeakerAirPlay:
         iOS 步骤 1-16 线性映射: -28.125 dB ~ 0 dB → 音箱 6% ~ 100%
         逆向: dB = (volume - 6) / 94 * 28.125 - 28.125
         """
-        import math
         if volume <= 0:
             return -144.0
         if volume >= 100:
@@ -330,7 +329,7 @@ class SpeakerAirPlay:
             self._poll_task = None
         try:
             await self.controller.stop()
-        except Exception as e:
+        except Exception:
             pass
 
     def _start_poll(self):
@@ -400,11 +399,11 @@ class SpeakerAirPlay:
                     else:
                         log.warning(f"[{self.device_name}] AirPlay 续播失败")
 
-                except Exception as e:
+                except Exception:
                     pass
         except asyncio.CancelledError:
             pass
-        except Exception as e:
+        except Exception:
             pass
 
     def _on_volume_change(self, vol_db: float):

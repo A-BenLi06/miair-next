@@ -17,6 +17,7 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
+from typing import Callable
 from urllib.parse import urlsplit
 
 log = logging.getLogger("miair")

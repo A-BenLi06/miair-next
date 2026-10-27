@@ -13,7 +13,6 @@ import logging
 import time
 from typing import TYPE_CHECKING, Callable
 
-import aiohttp
 from aiohttp import ClientSession, ClientTimeout
 
 from app.engine.const import LATEST_ASK_API, GET_ASK_BY_MINA
@@ -226,12 +225,12 @@ class ConversationPoller:
             except asyncio.CancelledError:
                 log.warning("Task was cancelled.")
                 return
-            except Exception as e:
+            except Exception:
                 continue
 
             try:
                 data = await r.json()
-            except Exception as e:
+            except Exception:
                 if i == 2:
                     log.info("多次解析失败，尝试重新登录")
                     await self.auth.login()
@@ -265,7 +264,7 @@ class ConversationPoller:
                     "answer": answer,
                 }
                 self._check_last_query(last_record)
-        except Exception as e:
+        except Exception:
             pass
         return
 
@@ -322,7 +321,7 @@ class ConversationPoller:
                     answer = answers[0].get("tts", {}).get("text", "").strip()
                     last_record["answer"] = answer
                 self._check_last_query(last_record)
-            except Exception as e:
+            except Exception:
                 pass
 
     def _check_last_query(self, last_record):

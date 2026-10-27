@@ -7,7 +7,6 @@ from app.engine.const import (
     CONNECTION_MANAGER_URN,
     DEVICE_TYPE,
     RENDERING_CONTROL_URN,
-    SUPPORTED_PROTOCOLS,
 )
 
 
@@ -695,7 +694,7 @@ RENDERING_CONTROL_SCPD = """<?xml version="1.0" encoding="utf-8"?>
 </scpd>"""
 
 
-CONNECTION_MANAGER_SCPD = f"""<?xml version="1.0" encoding="utf-8"?>
+CONNECTION_MANAGER_SCPD = """<?xml version="1.0" encoding="utf-8"?>
 <scpd xmlns="urn:schemas-upnp-org:service-1-0">
   <specVersion>
     <major>1</major>

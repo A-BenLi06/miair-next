@@ -83,8 +83,25 @@ data/
 | `MIAIR_DATA` | `/app/data` | 数据目录 |
 | `MIAIR_WEB_HOST` | `0.0.0.0` | Web 监听地址 |
 | `MIAIR_WEB_PORT` | `8300` | Web 管理后台端口(host 网络直连,无需 `-p` 映射) |
+| `MIAIR_HOSTNAME` | 自动探测 | 强制指定本机局域网 IP。优先级最高,覆盖持久化配置中的值;用于多网卡/软路由环境下自动探测到错误 IP(如回环地址)导致 AirPlay/DLNA 拉流无声时手动纠正 |
 | `MIAIR_GITHUB_REPO` | `deerwan/miair-next` | 检查更新用的 GitHub 仓库(Releases API) |
-| `MIAIR_TOKEN_EXPIRE_HOURS` | `24` | JWT 有效期(小时) |
+| `MIAIR_TOKEN_EXPIRE_HOURS` | `24` | 面板 JWT 有效期(小时) |
+| `MIAIR_TRUST_PROXY` | 空(关闭) | 置 `1` / `true` / `yes` 时采信 `X-Forwarded-For` / `X-Real-IP` 作为客户端 IP |
+| `MIAIR_RELOAD` | 空(关闭) | 置 `1` 开启 uvicorn 热重载(仅监听 `app/`)。**仅限本地开发** |
+| `MIAIR_DOCKER` | 空 | 强制让进程重启逻辑按容器内方式处理(退出交由容器策略拉起)。一般无需设置,程序通过 `/.dockerenv` 等自动检测 |
+| `MIAIR_SPOTIFY_VERBOSE` | 空(关闭) | 置 `1` / `true` / `yes` 时给 Soloist 子进程追加 `-v`,输出详细日志(排查 Spotify 连接问题) |
+
+### 关于 `MIAIR_TRUST_PROXY`
+
+⚠️ **只在面板确实部署于可信反向代理之后时才开启**。
+
+直连部署(客户端直接访问 8300)下若开启,登录限速会按可伪造的 `X-Forwarded-For` 计算,攻击者每次换一个头值即可绕过「连续失败锁定」,同时登录日志中的 IP 也会被污染。
+
+反向代理需保证覆盖(而非追加)该头,以 Nginx 为例:
+
+```nginx
+proxy_set_header X-Forwarded-For $remote_addr;
+```
 
 ## Spotify 畅联 (可选)
 
@@ -108,6 +125,7 @@ miair.example.com {
 ```
 
   Nginx 同理, 需额外为 `/api/v1/ws` 配置 WebSocket 升级头 (`Upgrade` / `Connection`);
+- 若置于反代之后, 请设置 `MIAIR_TRUST_PROXY=1`, 否则登录限速与登录日志看到的都是反代 IP(全部客户端被当成同一个来源, 一人失败次数过多会连带锁住所有人); 反之, **直连部署时不要设置**, 详见上文「关于 `MIAIR_TRUST_PROXY`」;
 - 反代只需转发 Web 管理后台。DLNA/AirPlay 的组播发现仅局域网有效, 无法也不应暴露到公网;
 - 配合防火墙限制 8300 仅本机/内网访问 (例如 `ufw allow from 192.168.0.0/16 to any port 8300`)。
 

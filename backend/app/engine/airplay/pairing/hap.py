@@ -3,7 +3,6 @@ import socket
 import threading
 import os
 import traceback
-from os import path
 
 import hkdf
 from cryptography.hazmat.primitives.asymmetric import x25519

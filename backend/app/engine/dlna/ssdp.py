@@ -5,7 +5,6 @@ import logging
 import random
 import socket
 import struct
-import time
 
 from app.engine.const import (
     AVTRANSPORT_URN,
@@ -169,7 +168,7 @@ class SSDPServer:
             await asyncio.wait_for(self._send_byebye(), timeout=2.0)
         except asyncio.TimeoutError:
             log.warning("SSDP byebye 发送超时")
-        except Exception as e:
+        except Exception:
             pass
 
         if self._alive_task:

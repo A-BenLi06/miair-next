@@ -164,7 +164,7 @@ class EventManager:
                 data=event_xml,
             ):
                 pass
-        except Exception as e:
+        except Exception:
             pass
 
     def start_cleanup(self):

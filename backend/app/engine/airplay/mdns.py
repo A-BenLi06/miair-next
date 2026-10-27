@@ -187,7 +187,7 @@ class AirPlayMDNS:
                 self._unregister_infos()
                 return
 
-            log.info(f"AirPlay 音频接收器 mDNS 广播已启动")
+            log.info("AirPlay 音频接收器 mDNS 广播已启动")
             log.info(f"  设备名称: {self.device_name}")
             log.info(f"  设备 ID: {self.device_id}")
             log.info(f"  RTSP 端口: {self.rtsp_port}")

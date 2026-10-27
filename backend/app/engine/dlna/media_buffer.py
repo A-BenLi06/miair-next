@@ -140,7 +140,7 @@ class MediaBuffer:
                     content_range = resp.headers.get("Content-Range", "")
                     if content_range:
                         return True
-        except Exception as e:
+        except Exception:
             pass
         return False
 
@@ -272,108 +272,3 @@ class MediaBuffer:
         self.data = bytearray()
         self.download_complete = False
 
-    async def convert_to_mp3(self) -> bool:
-        """将音频转换为mp3格式（用于不支持无损格式的音箱）"""
-        # 检查是否已经转换过或正在转换
-        if self._converted:
-            return True
-        if self._converting:
-            # 使用 Event 等待转换完成，最多60秒
-            try:
-                await asyncio.wait_for(self._convert_event.wait(), timeout=60)
-            except asyncio.TimeoutError:
-                pass
-            return self._converted
-        
-        # 检查是否已经是mp3
-        if self.content_type == "audio/mpeg" or self.content_type == "audio/mp3":
-            self._converted = True
-            return True
-        
-        self._converting = True
-        input_path = None
-        output_path = None
-        
-        try:
-            import tempfile
-            import os
-            
-            # 创建临时文件
-            with tempfile.NamedTemporaryFile(suffix='.input', delete=False) as input_file:
-                input_path = input_file.name
-                input_file.write(self.data)
-            
-            output_path = input_path + '.mp3'
-            
-            # 使用ffmpeg转换 - 优化参数提高速度
-            cmd = [
-                'ffmpeg', '-y', 
-                '-i', input_path,
-                '-vn',  # 禁用视频
-                '-codec:a', 'libmp3lame',
-                '-q:a', '5',  # 降低质量以提高速度 (0=最高质量, 9=最低)
-                '-ar', '44100',  # 标准采样率
-                '-ac', '2',  # 立体声
-                '-threads', '0',  # 使用所有可用线程
-                output_path
-            ]
-            
-            log.info(f"开始转换音频为mp3: {self.content_type} ({len(self.data)} bytes)")
-            
-            # 使用异步执行避免阻塞
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), 
-                    timeout=60
-                )
-            except asyncio.TimeoutError:
-                try:
-                    process.kill()
-                except Exception:
-                    pass
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=5)
-                except (asyncio.TimeoutError, Exception):
-                    log.warning("ffmpeg转换进程杀死后等待超时")
-                log.error("ffmpeg转换超时")
-                return False
-            
-            if process.returncode != 0:
-                stderr_str = stderr.decode('utf-8', errors='ignore') if stderr else ""
-                log.error(f"ffmpeg转换失败: {stderr_str[:200]}")
-                return False
-            
-            # 读取转换后的文件
-            with open(output_path, 'rb') as f:
-                converted_data = f.read()
-            
-            # 更新数据
-            original_size = len(self.data)
-            self.data = bytearray(converted_data)
-            self.total_size = len(self.data)
-            self.content_type = "audio/mpeg"
-            self._converted = True
-            
-            log.info(f"音频转换完成: {self.total_size} bytes (原 {original_size} bytes)")
-            return True
-            
-        except Exception as e:
-            log.error(f"音频转换失败: {e}")
-            return False
-        finally:
-            # 统一清理临时文件和状态
-            import os
-            for p in (input_path, output_path):
-                if p:
-                    try:
-                        os.unlink(p)
-                    except OSError:
-                        pass
-            self._converting = False
-            self._convert_event.set()

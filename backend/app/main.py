@@ -11,7 +11,7 @@ import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from app import __version__
@@ -78,6 +78,11 @@ def create_app() -> FastAPI:
 
         @app.get("/{full_path:path}")
         async def spa(full_path: str):
+            # 未匹配的 /api/* 必须返回 404 JSON 而非 SPA 页面:
+            # 否则前端拿到 HTML 去 JSON.parse 才报错, 排障时看不到真实原因
+            if full_path == "api" or full_path.startswith("api/"):
+                return JSONResponse({"detail": "Not Found"}, status_code=404)
+
             candidate = os.path.normpath(os.path.join(STATIC_DIR, full_path))
             # 防目录穿越: 用 commonpath 严格判断 candidate 确实在静态目录内,
             # 避免同前缀兄弟目录 (如 static-backup) 被误放行

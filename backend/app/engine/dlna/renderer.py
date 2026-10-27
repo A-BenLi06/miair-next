@@ -190,7 +190,12 @@ class DLNARenderer:
         except ET.ParseError:
             return "", ""
         didl_ns = "urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"
-        item = root.find(f".//{{{didl_ns}}}item") or root.find(".//item")
+        # 必须用 is None 判断: ElementTree 元素的真值语义是"有无子元素",
+        # 空 <item/> 会被判为 False 从而误落到无命名空间分支 (且该写法在
+        # 未来 Python 版本会反转行为, 已产生 DeprecationWarning)。
+        item = root.find(f".//{{{didl_ns}}}item")
+        if item is None:
+            item = root.find(".//item")
         if item is None:
             return "", ""
         ns = {

@@ -14,11 +14,8 @@ import queue
 import re
 import socket
 import struct
-import subprocess
-import sys
 import threading
 import time
-import uuid
 from typing import Callable
 
 import av
@@ -749,7 +746,7 @@ class AirPlayServer:
                 body = data[header_end + 4:]
 
                 if not header_lines:
-                    log.warning(f"RTSP 空请求头")
+                    log.warning("RTSP 空请求头")
                     continue
 
                 request_line = header_lines[0]
@@ -998,7 +995,7 @@ class AirPlayServer:
         status_text = {200: "OK", 400: "Bad Request", 500: "Internal Server Error"}.get(status, "OK")
         response = f"RTSP/1.0 {status} {status_text}\r\n"
         response += f"CSeq: {cseq}\r\n"
-        response += f"Server: AirTunes/105.1\r\n"
+        response += "Server: AirTunes/105.1\r\n"
         response += f"Content-Type: {content_type}\r\n"
         response += f"Content-Length: {len(body)}\r\n"
         response += "\r\n"
@@ -1067,14 +1064,14 @@ class AirPlayServer:
             if aes_key_type == "rsa":
                 # 解密 RSA AES 密钥
                 self._session_key = self._decrypt_rsa_aes_key(aes_key)
-                log.info(f"音频加密已启用 (RSA)")
+                log.info("音频加密已启用 (RSA)")
             else:
                 # 解密 FairPlay AES 密钥
                 try:
                     from app.engine.airplay.playfair import FairPlayAES
                     fp_aes = FairPlayAES(fpaeskey=aes_key, aesiv=aes_iv, keymsg=self._fp_keymsg)
                     self._session_key = fp_aes.aeskey
-                    log.info(f"音频加密已启用 (FairPlay)")
+                    log.info("音频加密已启用 (FairPlay)")
                 except ImportError as e:
                     log.error(f"无法加载 FairPlay 解密模块 (ap2): {e}")
                     # 如果缺少 ap2，尝试使用 fp_decrypt 中的逻辑或其他 fallback
@@ -1092,7 +1089,7 @@ class AirPlayServer:
             self._session_key = None
             self._session_iv = None
             self._session_iv16 = None
-            log.info(f"音频未加密")
+            log.info("音频未加密")
 
         # 初始化音频解码器
         self._init_decoder()
@@ -1360,7 +1357,7 @@ class AirPlayServer:
                     continue
                 except OSError:
                     break
-        except Exception as e:
+        except Exception:
             pass
         finally:
             rtcp_socket.close()
@@ -1747,7 +1744,7 @@ class AirPlayServer:
         response = f"RTSP/1.0 {code} {msg}\r\n"
         response += f"CSeq: {cseq}\r\n"
         # AirPlay 1 使用 AirTunes/105.1，AirPlay 2 使用 366.0
-        response += f"Server: AirTunes/105.1\r\n"
+        response += "Server: AirTunes/105.1\r\n"
 
         if headers:
             for key, value in headers.items():
