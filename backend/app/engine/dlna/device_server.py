@@ -93,7 +93,9 @@ class DeviceServer:
         self._paused_proxy_udns: set[str] = set()
         # 周期性缓冲清理任务
         self._buffer_cleanup_task: asyncio.Task | None = None
-        # 内存上限: 缓冲总大小不超过 200MB
+        # 内存上限: 缓冲总大小不超过 200MB;
+        # 与 media_buffer._MAX_DOWNLOAD_SIZE (64MB) 保持 >=3 倍关系,
+        # 确保单个大文件无法吃光预算、把正在播放的缓冲挤进淘汰逻辑
         self._max_buffer_memory = 200 * 1024 * 1024
         # fire-and-forget 任务集合
         self._background_tasks: set[asyncio.Task] = set()

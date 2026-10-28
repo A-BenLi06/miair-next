@@ -5,9 +5,22 @@ import logging
 import os
 import threading
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields as dataclass_fields
+
+from app.engine.secret_store import decrypt_value, encrypt_value, load_or_create_key
 
 log = logging.getLogger("miair")
+
+# 落盘时加密的敏感字段: 运行时 Config 对象保持明文 (掩码/回写流程
+# 无感知), 仅 save() 序列化前加密 / load() 解析后解密, 见 secret_store
+_SENSITIVE_FIELDS = (
+    "account",
+    "password",
+    "cookie",
+    "spotify_api_key",
+    "notify_feishu_secret",
+    "notify_wxpusher_spt",
+)
 
 
 @dataclass
@@ -329,9 +342,16 @@ class Config:
                     speakers_data[did] = speaker
             data["speakers"] = speakers_data
 
+            # 敏感字段加密后落盘: 内存对象保持明文, 掩码回写等流程不受影响
+            enc_key = load_or_create_key(self.conf_path)
+            for field_name in _SENSITIVE_FIELDS:
+                if data.get(field_name):
+                    data[field_name] = encrypt_value(enc_key, data[field_name])
+
             tmp_file = self.config_file + ".tmp"
             try:
-                # 0600 创建 (config.json 含明文账号密码/Cookie),
+                # 0600 创建 (纵深防御: 敏感字段已加密落盘, 但仍按含密
+                # 文件的基线处理; 升级前的历史文件也可能还是明文),
                 # 消除"先 0644 写完再 chmod"的权限窗口; os.replace 后权限随 tmp 保留
                 fd = os.open(tmp_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -368,10 +388,15 @@ class Config:
             with open(config_file, encoding="utf-8") as f:
                 data = json.load(f)
             data["conf_path"] = conf_path
-            # 过滤掉不存在的字段，避免TypeError
-            import inspect
-            sig = inspect.signature(cls.__init__)
-            valid_params = list(sig.parameters.keys())
-            filtered_data = {k: v for k, v in data.items() if k in valid_params}
+            # 解密敏感字段 (旧明文配置无前缀, 原样通过并在下次保存时升级)
+            enc_key = load_or_create_key(conf_path)
+            for field_name in _SENSITIVE_FIELDS:
+                if data.get(field_name):
+                    data[field_name] = decrypt_value(enc_key, data[field_name])
+            # 过滤掉不存在的字段，避免 TypeError。用 dataclasses.fields 而非
+            # inspect.signature: 后者只反映 __init__ 形参, 字段继承/重排
+            # 场景下会漏判; fields() 是 dataclass 字段定义的真实来源
+            valid_fields = {f.name for f in dataclass_fields(cls)}
+            filtered_data = {k: v for k, v in data.items() if k in valid_fields}
             return cls(**filtered_data)
         return cls(conf_path=conf_path)

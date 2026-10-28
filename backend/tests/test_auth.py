@@ -273,3 +273,99 @@ class TestLoginLogs:
         assert len(logs) == store.LOGIN_LOG_MAX_ROWS
         # 最旧的 5 条已被淘汰
         assert logs[-1]["username"] == "u5"
+
+
+class TestPasswordStrength:
+    """setup/改密的密码强度校验 (面板可暴露公网, 阻止弱口令)"""
+
+    def test_setup_rejects_short_password(self):
+        resp = _setup_admin(password="ab1cdef")  # 7 位
+        assert resp.status_code == 422
+
+    def test_setup_rejects_digits_only(self):
+        resp = _setup_admin(password="12345678")
+        assert resp.status_code == 422
+
+    def test_setup_rejects_letters_only(self):
+        resp = _setup_admin(password="abcdefgh")
+        assert resp.status_code == 422
+
+    def test_setup_rejects_password_equal_to_username(self):
+        resp = _setup_admin(username="admin1", password="admin1")
+        assert resp.status_code == 422
+
+    def test_setup_accepts_mixed_password(self):
+        resp = _setup_admin(password="pass1234")
+        assert resp.status_code == 200
+
+    def test_change_password_rejects_weak_new_password(self):
+        token = _setup_admin().json()["access_token"]
+        resp = client.post(
+            "/api/v1/login/password",
+            json={"old_password": "pass1234", "new_password": "12345678"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 422
+
+    def test_login_not_affected_by_strength_rules(self):
+        """登录不做强度校验: 历史弱密码必须仍能用于登录"""
+        _setup_admin()
+        resp = client.post(
+            "/api/v1/login", json={"username": "admin", "password": "short"}
+        )
+        assert resp.status_code == 401  # 422 (校验) 而非 401 (密码错误) 才是破坏
+
+
+class TestJwtClaims:
+    def test_token_contains_iat_and_exp(self):
+        from jose import jwt as jose_jwt
+
+        from app.core.security import decode_access_token
+
+        token = _setup_admin().json()["access_token"]
+        payload = jose_jwt.get_unverified_claims(token)
+        assert payload["sub"] == "admin"
+        assert payload["iat"]
+        assert payload["exp"] > payload["iat"]
+        assert decode_access_token(token) == "admin"
+
+
+class TestRateLimitPersistence:
+    """限速持久化: 重启后从 login_logs 恢复锁定状态 (防重启重置爆破锁定)"""
+
+    def test_get_recent_failures_returns_timestamps(self):
+        store.add_login_log("admin", "1.2.3.4", success=False)
+        store.add_login_log("admin", "1.2.3.4", success=False)
+        store.add_login_log("admin", "5.6.7.8", success=True)  # 成功不计入
+        failures = store.get_recent_failures(window_seconds=600)
+        assert len(failures["1.2.3.4"]) == 2
+        assert "5.6.7.8" not in failures
+
+    def test_restore_locks_new_limiter(self):
+        from app.core.security import LoginRateLimiter
+
+        # 模拟已触发锁定的失败记录 (login_logs 是持久层)
+        for _ in range(get_settings().login_max_failures):
+            store.add_login_log("admin", "1.2.3.4", success=False)
+        failures = store.get_recent_failures(window_seconds=600)
+        assert len(failures["1.2.3.4"]) >= get_settings().login_max_failures
+
+        # "重启"后新建的 limiter: 无恢复则锁定被重置
+        fresh = LoginRateLimiter(5, 600)
+        assert fresh.is_locked("1.2.3.4") == 0
+        # 恢复后锁定连续, 且剩余时间按真实时间戳计算
+        fresh.restore(failures)
+        assert fresh.is_locked("1.2.3.4") > 0
+
+    def test_restore_preserves_remaining_lockout_time(self):
+        """恢复真实时间戳: 早期失败占满窗口时锁定应已自然到期"""
+        import time as time_mod
+
+        from app.core.security import LoginRateLimiter
+
+        limiter = LoginRateLimiter(5, 2)  # 2 秒窗口, 便于模拟过期
+        old = time_mod.time() - 10
+        failures = {"1.2.3.4": [old] * 5}
+        limiter.restore(failures)
+        # 窗口外的记录不算数, 不应锁定 (伪造 now 时间戳会错误锁定)
+        assert limiter.is_locked("1.2.3.4") == 0

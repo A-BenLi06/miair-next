@@ -24,6 +24,11 @@ class RingBufferHandler(logging.Handler):
 
     def subscribe(self) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue(maxsize=200)
+        # 回放环形缓冲中的历史日志: WS 重连 (网络抖动/页面切换) 后,
+        # 订阅者立即看到上下文而非空白等待新日志;
+        # 历史超过队列容量时只保留最新的, 与广播时的丢弃策略一致
+        for line in list(self.buffer)[-q.maxsize:]:
+            q.put_nowait(line)
         self._subscribers.add(q)
         return q
 

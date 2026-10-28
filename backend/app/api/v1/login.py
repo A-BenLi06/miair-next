@@ -1,5 +1,6 @@
 """登录 / 账号初始化 / 修改密码"""
 
+import asyncio
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -52,15 +53,19 @@ def _engine_config(request: Request):
 @router.get("/login/status", response_model=LoginStatusResponse)
 async def login_status():
     """是否已初始化管理员 (用于前端首次引导)"""
-    return LoginStatusResponse(initialized=store.is_initialized())
+    return LoginStatusResponse(initialized=await asyncio.to_thread(store.is_initialized))
 
 
 @router.post("/login/setup", response_model=TokenResponse)
 async def setup_admin(payload: SetupRequest):
     """首次设置管理员账号 (仅未初始化时可用)"""
-    if store.is_initialized():
+    if await asyncio.to_thread(store.is_initialized):
         raise HTTPException(status_code=400, detail="管理员已初始化")
-    if not store.create_user(payload.username, hash_password(payload.password)):
+    # bcrypt 是 CPU 密集操作 (百毫秒级), sqlite 为同步 IO;
+    # 都必须移入线程池, 否则登录瞬间会卡住事件循环上的
+    # WS 状态推送与 DLNA 事件回调
+    hashed = await asyncio.to_thread(hash_password, payload.password)
+    if not await asyncio.to_thread(store.create_user, payload.username, hashed):
         raise HTTPException(status_code=400, detail="创建管理员失败")
     return TokenResponse(access_token=create_access_token(payload.username))
 
@@ -76,10 +81,11 @@ async def login(payload: LoginRequest, request: Request):
             status_code=429, detail=f"失败次数过多, 请 {locked} 秒后重试"
         )
 
-    hashed = store.get_password_hash(payload.username)
-    if not hashed or not verify_password(payload.password, hashed):
+    hashed = await asyncio.to_thread(store.get_password_hash, payload.username)
+    ok = bool(hashed) and await asyncio.to_thread(verify_password, payload.password, hashed)
+    if not ok:
         login_limiter.record_failure(ip)
-        store.add_login_log(payload.username, ip, success=False)
+        await asyncio.to_thread(store.add_login_log, payload.username, ip, success=False)
         # 刚达到锁定阈值时告警 (而非每次失败都推, 避免爆破刷屏)
         if login_limiter.is_locked(ip):
             notify_async(
@@ -93,7 +99,7 @@ async def login(payload: LoginRequest, request: Request):
         raise HTTPException(status_code=401, detail="用户名或密码错误")
 
     login_limiter.reset(ip)
-    store.add_login_log(payload.username, ip, success=True)
+    await asyncio.to_thread(store.add_login_log, payload.username, ip, success=True)
     # 登录成功提醒 (短节流 60s, 避免 token 过期后频繁重登刷屏)
     notify_async(
         config,
@@ -111,14 +117,16 @@ async def change_password(
     username: str = Depends(get_current_user),
 ):
     """修改密码 (需登录)"""
-    hashed = store.get_password_hash(username)
-    if not hashed or not verify_password(payload.old_password, hashed):
+    hashed = await asyncio.to_thread(store.get_password_hash, username)
+    ok = bool(hashed) and await asyncio.to_thread(verify_password, payload.old_password, hashed)
+    if not ok:
         raise HTTPException(status_code=400, detail="原密码错误")
-    store.update_password(username, hash_password(payload.new_password))
+    new_hash = await asyncio.to_thread(hash_password, payload.new_password)
+    await asyncio.to_thread(store.update_password, username, new_hash)
     # 轮换 JWT 密钥, 立即吊销所有已签发 token (含当前会话)。
     # 改密本身即为发现凭据泄露后的止损动作, 旧 token 必须即刻失效;
     # 客户端随后请求将收到 401 并跳转重新登录 (WS 经 4401 分支登出)。
-    get_settings().rotate_secret()
+    await asyncio.to_thread(get_settings().rotate_secret)
     return {"ok": True}
 
 
@@ -128,7 +136,7 @@ async def login_logs(
     _: str = Depends(get_current_user),
 ):
     """最近的面板登录日志 (需登录)"""
-    return {"logs": store.get_login_logs(min(limit, 100))}
+    return {"logs": await asyncio.to_thread(store.get_login_logs, min(limit, 100))}
 
 
 @router.get("/me")

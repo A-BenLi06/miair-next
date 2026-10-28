@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { fetchMe } from '@/api/auth'
+import { disconnectWebSocket } from '@/composables/useWebSocket'
 
 /** 登录状态: token 存取 (localStorage 持久化) */
 export const useAuthStore = defineStore('auth', () => {
@@ -26,6 +27,8 @@ export const useAuthStore = defineStore('auth', () => {
     token.value = ''
     username.value = ''
     localStorage.removeItem('access-token')
+    // 登出时断开实时连接 (WS/日志/状态均为登录态数据)
+    disconnectWebSocket()
   }
 
   return { token, username, setToken, refreshUser, logout }

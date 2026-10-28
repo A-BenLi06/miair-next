@@ -44,8 +44,8 @@ onMounted(async () => {
 })
 
 async function submit() {
-  if (password.value.length < 6) {
-    message.warning('密码至少 6 位')
+  if (password.value.length < 8 || !/[a-zA-Z]/.test(password.value) || !/\d/.test(password.value)) {
+    message.warning('密码至少 8 位, 且需同时包含字母和数字')
     return
   }
   if (password.value !== confirm.value) {

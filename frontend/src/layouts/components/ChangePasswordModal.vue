@@ -37,8 +37,8 @@ const newPwd = ref('')
 const loading = ref(false)
 
 async function submit() {
-  if (!oldPwd.value || newPwd.value.length < 6) {
-    message.warning('请填写原密码, 新密码至少 6 位')
+  if (!oldPwd.value || newPwd.value.length < 8 || !/[a-zA-Z]/.test(newPwd.value) || !/\d/.test(newPwd.value)) {
+    message.warning('请填写原密码, 新密码至少 8 位且需包含字母和数字')
     return
   }
   loading.value = true

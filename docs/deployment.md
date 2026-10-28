@@ -124,7 +124,27 @@ miair.example.com {
 }
 ```
 
-  Nginx 同理, 需额外为 `/api/v1/ws` 配置 WebSocket 升级头 (`Upgrade` / `Connection`);
+  Nginx 同理, `/api/v1/ws` 是 WebSocket, 必须配置升级头, 完整示例:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name miair.example.com;
+    # ssl_certificate / ssl_certificate_key 按实际路径填写
+
+    location / {
+        proxy_pass http://127.0.0.1:8300;
+        # WebSocket 升级 (实时日志与音箱状态推送走 /api/v1/ws)
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        # 覆盖 (而非追加) 客户端 IP 头, 防伪造绕过登录限速
+        proxy_set_header X-Forwarded-For $remote_addr;
+        # WS 长连接需要比默认值更长的空闲超时
+        proxy_read_timeout 300s;
+    }
+}
+```
 - 若置于反代之后, 请设置 `MIAIR_TRUST_PROXY=1`, 否则登录限速与登录日志看到的都是反代 IP(全部客户端被当成同一个来源, 一人失败次数过多会连带锁住所有人); 反之, **直连部署时不要设置**, 详见上文「关于 `MIAIR_TRUST_PROXY`」;
 - 反代只需转发 Web 管理后台。DLNA/AirPlay 的组播发现仅局域网有效, 无法也不应暴露到公网;
 - 配合防火墙限制 8300 仅本机/内网访问 (例如 `ufw allow from 192.168.0.0/16 to any port 8300`)。

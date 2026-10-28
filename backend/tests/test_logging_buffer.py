@@ -46,6 +46,36 @@ def test_unsubscribed_client_does_not_receive_pending_broadcast():
     asyncio.run(run())
 
 
+def test_subscribe_replays_buffered_history():
+    """新订阅者应立即回放环形缓冲中的历史日志 (WS 重连不丢上下文)。"""
+    async def run():
+        handler = log_config.RingBufferHandler()
+        handler.set_loop(asyncio.get_running_loop())
+        for msg in ("old-1", "old-2"):
+            await asyncio.to_thread(handler.emit, record(msg))
+        queue = handler.subscribe()
+        # 无需等待新日志, 订阅即可读到此前的历史
+        assert queue.qsize() == 2
+        assert queue.get_nowait() == "old-1"
+        assert queue.get_nowait() == "old-2"
+        # 订阅之后的 emit 照常实时广播
+        await asyncio.to_thread(handler.emit, record("live"))
+        assert await asyncio.wait_for(queue.get(), timeout=1) == "live"
+
+    asyncio.run(run())
+
+
+def test_subscribe_replay_caps_at_queue_capacity():
+    """历史超过队列容量 (200) 时只保留最新的, 对齐广播丢弃策略。"""
+    handler = log_config.RingBufferHandler()
+    for i in range(250):
+        handler.emit(record(str(i)))
+    queue = handler.subscribe()
+    assert queue.qsize() == 200
+    assert queue.get_nowait() == "50"
+    assert queue.get_nowait() == "51"
+
+
 def test_logging_after_loop_shutdown_still_updates_buffer():
     handler = log_config.RingBufferHandler()
     loop = asyncio.new_event_loop()

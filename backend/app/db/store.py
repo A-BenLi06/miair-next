@@ -3,7 +3,7 @@
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from app.core.config import get_settings
 
@@ -123,3 +123,28 @@ def get_login_logs(limit: int = 50) -> list[dict]:
             }
             for r in rows
         ]
+
+
+def get_recent_failures(window_seconds: int) -> dict[str, list[float]]:
+    """窗口期内登录失败的 IP -> 失败时间戳列表 (epoch 秒)
+
+    供进程重启后恢复限速锁定状态: 记录在 login_logs 表中天然持久,
+    恢复真实时间戳可保证锁定剩余时间准确 (而非重新计时)。
+    """
+    cutoff = (
+        datetime.now() - timedelta(seconds=window_seconds)
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    with _lock, _connect() as conn:
+        rows = conn.execute(
+            "SELECT ip, created_at FROM login_logs "
+            "WHERE success = 0 AND created_at > ? ORDER BY id",
+            (cutoff,),
+        ).fetchall()
+    failures: dict[str, list[float]] = {}
+    for r in rows:
+        try:
+            ts = datetime.strptime(r["created_at"], "%Y-%m-%d %H:%M:%S").timestamp()
+        except ValueError:
+            continue
+        failures.setdefault(r["ip"], []).append(ts)
+    return failures

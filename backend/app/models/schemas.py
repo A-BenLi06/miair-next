@@ -2,7 +2,7 @@
 
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # ---- 认证 ----
 
@@ -16,14 +16,38 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
 
 
+def _require_password_strength(value: str) -> str:
+    """面板可暴露公网, 阻止纯数字/纯字母弱口令"""
+    if not any(c.isalpha() for c in value) or not any(c.isdigit() for c in value):
+        raise ValueError("密码需同时包含字母和数字")
+    return value
+
+
 class SetupRequest(BaseModel):
     username: str = Field(default="admin", min_length=1, max_length=64)
-    password: str = Field(min_length=6, max_length=128)
+    password: str = Field(min_length=8, max_length=128)
+
+    @field_validator("password")
+    @classmethod
+    def _validate_password(cls, v: str) -> str:
+        return _require_password_strength(v)
+
+    @model_validator(mode="after")
+    def _password_differs_from_username(self):
+        """用户名即密码是最常见的弱口令组合 (admin/admin), 直接拒绝"""
+        if self.password == self.username:
+            raise ValueError("密码不能与用户名相同")
+        return self
 
 
 class PasswordChangeRequest(BaseModel):
     old_password: str
-    new_password: str = Field(min_length=6, max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
+
+    @field_validator("new_password")
+    @classmethod
+    def _validate_password(cls, v: str) -> str:
+        return _require_password_strength(v)
 
 
 class LoginStatusResponse(BaseModel):

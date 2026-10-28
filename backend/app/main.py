@@ -18,6 +18,7 @@ from app import __version__
 from app.api.v1 import protected_router, public_router, ws_router
 from app.core.config import get_settings
 from app.core.logging import ring_handler, setup_logging
+from app.core.security import login_limiter
 from app.db import store
 from app.engine.config import Config
 from app.services.orchestrator import Orchestrator
@@ -38,6 +39,9 @@ async def lifespan(app: FastAPI):
 
     # 用户数据库
     store.init_db()
+    # 从登录日志恢复窗口内的失败记录, 保持重启前后限速锁定连续
+    # (否则攻击者可通过触发容器重启来重置爆破锁定)
+    login_limiter.restore(store.get_recent_failures(settings.login_lockout_seconds))
 
     # 启动编排器 (DLNA / AirPlay / 小米云)
     orchestrator = Orchestrator(engine_config)

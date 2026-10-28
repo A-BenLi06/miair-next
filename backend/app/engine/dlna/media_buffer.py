@@ -22,8 +22,10 @@ _DOWNLOAD_THREADS = 8  # 并发下载线程数
 _CHUNK_SIZE = 1024 * 1024  # 每个分块大小 1MB
 _MIN_SIZE_FOR_MULTI_THREAD = 5 * 1024 * 1024  # 最小5MB才使用多线程
 # 单文件下载硬上限: 媒体代理端点无鉴权, 远端 Content-Length 不可信
-# (恶意/异常服务器可声明超大值), 预分配与下载循环必须限流防 OOM
-_MAX_DOWNLOAD_SIZE = 200 * 1024 * 1024
+# (恶意/异常服务器可声明超大值), 预分配与下载循环必须限流防 OOM;
+# 且必须显著低于 DeviceServer 的全局缓冲预算 (200MB): 若单文件可吃光
+# 全部预算, 下一个缓冲创建时的内存淘汰会按插入序清掉正在播放的缓冲
+_MAX_DOWNLOAD_SIZE = 64 * 1024 * 1024
 
 
 class MediaBuffer:

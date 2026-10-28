@@ -30,9 +30,12 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 def create_access_token(subject: str) -> str:
     settings = get_settings()
+    now = datetime.now(timezone.utc)
     payload = {
         "sub": subject,
-        "exp": datetime.now(timezone.utc) + timedelta(hours=settings.token_expire_hours),
+        # iat: 签发时间, 供审计与后续滑动过期/刷新机制使用
+        "iat": now,
+        "exp": now + timedelta(hours=settings.token_expire_hours),
     }
     return jwt.encode(payload, settings.secret_key, algorithm=ALGORITHM)
 
@@ -88,6 +91,17 @@ class LoginRateLimiter:
 
     def record_failure(self, key: str):
         self._failures.setdefault(key, []).append(time.time())
+        self._evict_if_needed()
+
+    def restore(self, failures: dict[str, list[float]]) -> None:
+        """从持久化记录恢复失败计数 (进程重启后调用, 保持锁定状态连续)
+
+        恢复的是真实失败时间戳, 锁定剩余时间因此准确;
+        否则攻击者可通过触发容器重启 (auto_restart 等) 重置爆破锁定。
+        """
+        for key, stamps in failures.items():
+            merged = sorted(self._failures.get(key, []) + stamps)
+            self._failures[key] = merged
         self._evict_if_needed()
 
     def reset(self, key: str):
