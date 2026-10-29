@@ -389,6 +389,27 @@ class Config:
             with open(config_file, encoding="utf-8") as f:
                 data = json.load(f)
             data["conf_path"] = conf_path
+            # hostname 是自动探测结果并会持久化。设备重启、Wi-Fi 切换或容器
+            # 网络变化后旧值可能仍是格式合法但已不可达的地址；启动时重新探测，
+            # MIAIR_HOSTNAME 仍作为明确的人工覆盖入口。
+            saved_hostname = str(data.get("hostname") or "").strip()
+            if saved_hostname and not os.getenv("MIAIR_HOSTNAME", "").strip():
+                import ipaddress
+
+                try:
+                    ipaddress.ip_address(saved_hostname)
+                except ValueError:
+                    # 非 IP 主机名可能是用户配置的 DNS 名称，保留它。
+                    pass
+                else:
+                    detected_hostname = cls._detect_local_ip()
+                    if saved_hostname != detected_hostname:
+                        log.warning(
+                            f"持久化的广播地址 {saved_hostname} 已重新探测为 "
+                            f"{detected_hostname}; 如需固定地址请设置 "
+                            "MIAIR_HOSTNAME=<本机局域网IP>"
+                        )
+                    data["hostname"] = detected_hostname
             # 解密敏感字段 (旧明文配置无前缀, 原样通过并在下次保存时升级)
             enc_key = load_or_create_key(conf_path)
             for field_name in _SENSITIVE_FIELDS:

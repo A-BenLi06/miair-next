@@ -77,6 +77,8 @@ data/
 
 > ⚠️ **凭据存储**: `conf/config.json` 中的小米账号密码、Cookie、飞书 Webhook、Spotify API Key 等敏感字段使用 AES-GCM 加密；`conf/enc.key` 必须与配置一起备份。`.mi.token` 仍包含明文 serviceToken，文件权限限制为 `600`。`enc.key` 与配置位于同一目录，因此整个数据目录或备份仍应妥善保护并加密存放。
 
+DLNA 媒体缓冲的大文件会滚动写入 `conf` 所在的数据目录，普通播放和代理 Range 响应按块读写。缓冲总量最多 200 MiB，并根据剩余空间下调预算；请确保数据目录可写且有足够空间。
+
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |
@@ -84,7 +86,7 @@ data/
 | `MIAIR_DATA` | `/app/data` | 数据目录 |
 | `MIAIR_WEB_HOST` | `0.0.0.0` | Web 监听地址 |
 | `MIAIR_WEB_PORT` | `8300` | Web 管理后台端口(host 网络直连,无需 `-p` 映射) |
-| `MIAIR_HOSTNAME` | 自动探测 | 强制指定本机局域网 IP。优先级最高,覆盖持久化配置中的值;用于多网卡/软路由环境下自动探测到错误 IP(如回环地址)导致 AirPlay/DLNA 拉流无声时手动纠正 |
+| `MIAIR_HOSTNAME` | 自动探测 | 强制指定本机局域网 IP。优先级最高,覆盖持久化配置中的值;用于多网卡/软路由环境下自动探测到错误 IP 时手动纠正。持久化的自动探测 IP 会在每次启动时重新检测,以适应网卡或网络变化 |
 | `MIAIR_GITHUB_REPO` | `deerwan/miair-next` | 检查更新用的 GitHub 仓库(Releases API) |
 | `MIAIR_TOKEN_EXPIRE_HOURS` | `24` | 面板 JWT 有效期(小时) |
 | `MIAIR_TRUST_PROXY` | 空(关闭) | 置 `1` / `true` / `yes` 时采信 `X-Forwarded-For` / `X-Real-IP` 作为客户端 IP |

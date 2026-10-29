@@ -38,6 +38,11 @@ def _collect_status(orch) -> dict:
                 # 不少 App 切歌时不更新, 展示出来常与实际内容不符
                 # (设备名与"播放中"状态是可靠的, 保留)
                 source = "airplay"
+        airplay_audio = None
+        if orch.airplay_manager:
+            sap = orch.airplay_manager.speaker_airplays.get(did)
+            if sap and sap.airplay_server:
+                airplay_audio = sap.airplay_server.get_audio_diagnostics()
         spotify_info = collect_spotify_speaker_status(orch, did)
         if airplay_active:
             # AirPlay 实际发声时清掉可能残留的 DLNA 标题, 避免串台
@@ -59,6 +64,7 @@ def _collect_status(orch) -> dict:
             "transport_state": renderer.transport_state if renderer else "UNKNOWN",
             "current_uri": renderer.current_uri if renderer else "",
             "airplay_active": airplay_active,
+            "airplay_audio": airplay_audio,
             "now_playing": {
                 "playing": bool(renderer and renderer.transport_state == "PLAYING")
                 or airplay_active

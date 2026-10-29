@@ -7,6 +7,7 @@
 """
 
 import asyncio
+from collections import deque
 import logging
 import queue
 import secrets
@@ -22,6 +23,8 @@ log = logging.getLogger("miair")
 
 # 缓冲队列上限（约 800ms，兼顾抗抖动与实时性）
 _QUEUE_MAXSIZE = 100
+# HTTP 写入受阻时保留的待发送 PCM 上限（约 1.3 秒立体声 44.1 kHz）。
+_PENDING_MAX_BYTES = 256 * 1024
 _MAX_STREAM_CLIENTS = 4
 
 
@@ -68,6 +71,9 @@ class AudioStreamServer:
         self._session_id = secrets.token_urlsafe(32)
         self._client_count = 0
         self._client_lock = threading.Lock()
+        self._pending_drop_bytes = 0
+        self._pending_drop_lock = threading.Lock()
+        self._last_pending_drop_log = 0.0
 
         self._setup_routes()
 
@@ -94,6 +100,23 @@ class AudioStreamServer:
         """是否有音箱正在拉取音频流"""
         with self._client_lock:
             return self._client_count > 0
+
+    @property
+    def client_count(self) -> int:
+        """当前拉取音频流的客户端数量"""
+        with self._client_lock:
+            return self._client_count
+
+    @property
+    def queue_depth(self) -> int:
+        """待发送 PCM 块数量，供运行诊断查看"""
+        return self._audio_queue.qsize()
+
+    @property
+    def pending_drop_bytes(self) -> int:
+        """慢速 HTTP 客户端导致丢弃的过期 PCM 字节数"""
+        with self._pending_drop_lock:
+            return self._pending_drop_bytes
 
     async def start(self):
         self._runner = web.AppRunner(self._app, access_log=None)
@@ -123,6 +146,8 @@ class AudioStreamServer:
         self._abort = False
         if new_session:
             self._session_id = secrets.token_urlsafe(32)
+            with self._pending_drop_lock:
+                self._pending_drop_bytes = 0
         while True:
             try:
                 self._audio_queue.get_nowait()
@@ -242,10 +267,37 @@ class AudioStreamServer:
         # 使用连接私有的中断事件，避免重连时被旧连接清理逻辑误置位
         loop = asyncio.get_event_loop()
         data_ready = asyncio.Event()
-        pending_data: list[bytes] = []
+        pending_data: deque[bytes] = deque()
+        pending_bytes = 0
         data_lock = threading.Lock()
         writer_done = False
         conn_abort = threading.Event()
+
+        def _append_pending(chunks: list[bytes]) -> None:
+            """写入连接待发送区，并在慢客户端时丢弃过期 PCM。"""
+            nonlocal pending_bytes
+            dropped_bytes = 0
+            with data_lock:
+                for chunk in chunks:
+                    pending_data.append(chunk)
+                    pending_bytes += len(chunk)
+                while pending_bytes > _PENDING_MAX_BYTES and pending_data:
+                    dropped = len(pending_data.popleft())
+                    dropped_bytes += dropped
+                    pending_bytes -= dropped
+            if dropped_bytes:
+                # 读取线程可能同时服务多个拉流客户端；集中计数并限频记录。
+                with self._pending_drop_lock:
+                    self._pending_drop_bytes += dropped_bytes
+                    now = time.monotonic()
+                    should_log = now - self._last_pending_drop_log > 10.0
+                    if should_log:
+                        self._last_pending_drop_log = now
+                if should_log:
+                    log.warning(
+                        f"{self._label} HTTP 音频客户端写入滞后，丢弃过期 PCM "
+                        f"({dropped_bytes} bytes)"
+                    )
 
         def _reader_thread():
             """专用线程：从队列批量读取 PCM 并通知事件循环"""
@@ -266,8 +318,7 @@ class AudioStreamServer:
                                 local_batch.append(extra)
                             except queue.Empty:
                                 break
-                        with data_lock:
-                            pending_data.extend(local_batch)
+                        _append_pending(local_batch)
                         loop.call_soon_threadsafe(data_ready.set)
                         empty_streak = 0
                     except queue.Empty:
@@ -275,8 +326,7 @@ class AudioStreamServer:
                         # 持续无数据时填充静音帧以维持 HTTP 连接
                         if empty_streak > 100:
                             silence = b'\x00' * (self._sample_rate * self._channels * self._sample_width // 50)
-                            with data_lock:
-                                pending_data.append(silence)
+                            _append_pending([silence])
                             loop.call_soon_threadsafe(data_ready.set)
                         continue
             except Exception as e:
@@ -295,8 +345,9 @@ class AudioStreamServer:
                 await data_ready.wait()
                 data_ready.clear()
                 with data_lock:
-                    chunks = pending_data
-                    pending_data = []
+                    chunks = list(pending_data)
+                    pending_data.clear()
+                    pending_bytes = 0
                 if chunks:
                     await response.write(b"".join(chunks))
         except (ConnectionResetError, BrokenPipeError):

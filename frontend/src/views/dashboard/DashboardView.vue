@@ -74,6 +74,52 @@
               🎧 {{ spotifyTrackText(sp.spotify) }}
             </div>
             <div v-if="sp.current_uri" class="uri">{{ sp.current_uri }}</div>
+            <n-space
+              v-if="sp.airplay_audio && (sp.airplay_active || sp.airplay_audio.rtp_packets_received > 0)"
+              :size="6"
+              style="margin-top: 8px"
+            >
+              <n-tag size="small" :type="sp.airplay_audio.rtp_packets_received ? 'success' : 'warning'">
+                RTP {{ sp.airplay_audio.rtp_packets_received }} 包
+              </n-tag>
+              <n-tag size="small" :type="sp.airplay_audio.decode_errors ? 'error' : 'success'">
+                解码错误 {{ sp.airplay_audio.decode_errors }}
+              </n-tag>
+              <n-tag size="small" :type="sp.airplay_audio.decode_success ? 'success' : 'warning'">
+                解码成功 {{ sp.airplay_audio.decode_success }}
+              </n-tag>
+              <n-tag size="small" :type="sp.airplay_audio.stream_clients ? 'success' : 'warning'">
+                音箱拉流 {{ sp.airplay_audio.stream_clients ? '已连接' : '未连接' }}
+              </n-tag>
+              <n-tag size="small" :type="sp.airplay_audio.rtp_queue_drops ? 'warning' : 'default'">
+                RTP 队列丢包 {{ sp.airplay_audio.rtp_queue_drops }}
+              </n-tag>
+              <n-tag size="small" :type="sp.airplay_audio.decrypt_failures ? 'error' : 'default'">
+                解密失败 {{ sp.airplay_audio.decrypt_failures }}
+              </n-tag>
+              <n-tag size="small" :type="sp.airplay_audio.lost_frames_filled ? 'warning' : 'default'">
+                补静音帧 {{ sp.airplay_audio.lost_frames_filled }}
+              </n-tag>
+              <n-tag size="small" type="default">
+                PCM {{ sp.airplay_audio.sample_rate }} Hz / {{ sp.airplay_audio.channels }} ch
+              </n-tag>
+              <n-tag v-if="sp.airplay_audio.last_rtp_packet_age_seconds != null" size="small" type="default">
+                最近 RTP {{ sp.airplay_audio.last_rtp_packet_age_seconds }} 秒前
+              </n-tag>
+              <n-tag size="small" :type="sp.airplay_audio.stream_queue_depth > 80 ? 'warning' : 'default'">
+                PCM 队列 {{ sp.airplay_audio.stream_queue_depth }}
+              </n-tag>
+              <n-tag
+                v-if="sp.airplay_audio.stream_pending_dropped_bytes > 0"
+                size="small"
+                type="warning"
+              >
+                慢客户端丢弃 {{ Math.round(sp.airplay_audio.stream_pending_dropped_bytes / 1024) }} KiB
+              </n-tag>
+            </n-space>
+            <n-text v-if="sp.airplay_audio?.last_decode_error" depth="3" class="uri">
+              最近解码错误: {{ sp.airplay_audio.last_decode_error }}
+            </n-text>
           </n-thing>
         </n-list-item>
       </n-list>
