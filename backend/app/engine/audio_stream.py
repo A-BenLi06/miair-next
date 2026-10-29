@@ -7,7 +7,6 @@
 """
 
 import asyncio
-from collections import deque
 import logging
 import queue
 import secrets
@@ -15,9 +14,12 @@ import struct
 import subprocess
 import threading
 import time
+from collections import deque
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from aiohttp import web
+
+from app.engine.airplay.timed_audio import TimedPCM, clock_ns
 
 log = logging.getLogger("miair")
 
@@ -52,6 +54,9 @@ class AudioStreamServer:
         audio_format: str = "wav",
         label: str = "AirPlay",
         route_prefix: str = "airplay",
+        *,
+        isolate_sessions: bool = False,
+        output_latency_ms: int | None = None,
     ):
         self.hostname = hostname
         self._label = label
@@ -74,6 +79,18 @@ class AudioStreamServer:
         self._pending_drop_bytes = 0
         self._pending_drop_lock = threading.Lock()
         self._last_pending_drop_log = 0.0
+        # AirPlay 2 control boundaries must retire both queued PCM and the
+        # downstream HTTP connection. Keep the legacy AirPlay 1 path unchanged.
+        self._isolate_sessions = isolate_sessions
+        self._output_latency_ns = (output_latency_ms * 1_000_000
+                                   if output_latency_ms is not None else None)
+        self._queue_capacity = 1000 if output_latency_ms is not None else _QUEUE_MAXSIZE
+        self._stream_lock = threading.RLock()
+        self._generation = 0
+        self._isolated_clients: dict[object, tuple] = {}
+        # Called outside _stream_lock; the receiver retires the HTTP session
+        # and reissues an official MiNA URL without disconnecting AirPlay.
+        self.on_clock_resync = None
 
         self._setup_routes()
 
@@ -127,11 +144,14 @@ class AudioStreamServer:
         log.info(f"{self._label} 音频流服务器: http://{self.hostname}:{self.port} (格式: {self._audio_format})")
 
     async def stop(self):
-        self._active = False
-        try:
-            self._audio_queue.put_nowait(None)
-        except queue.Full:
-            pass
+        if self._isolate_sessions:
+            self.stop_streaming()
+        else:
+            self._active = False
+            try:
+                self._audio_queue.put_nowait(None)
+            except queue.Full:
+                pass
         if self._runner:
             await self._runner.cleanup()
 
@@ -141,7 +161,20 @@ class AudioStreamServer:
         self._sample_width = sample_width
 
     def start_streaming(self, *, new_session: bool = True):
-        """开始或重置接收音频；只有新播放会话才轮换拉流令牌。"""
+        """Start or reset PCM reception, rotating the token for a new session."""
+        if self._isolate_sessions:
+            with self._stream_lock:
+                self._retire_isolated_clients()
+                self._generation += 1
+                if new_session:
+                    self._session_id = secrets.token_urlsafe(32)
+                    with self._pending_drop_lock:
+                        self._pending_drop_bytes = 0
+                self._audio_queue = queue.Queue(maxsize=self._queue_capacity)
+                self._active = True
+                self._abort = False
+            log.info("AirPlay 2 新音频会话: generation=%s", self._generation)
+            return
         self._active = True
         self._abort = False
         if new_session:
@@ -156,6 +189,17 @@ class AudioStreamServer:
         log.info(f"音频流: 开始接收 PCM 数据 (格式: {self._audio_format})")
 
     def stop_streaming(self):
+        if self._isolate_sessions:
+            with self._stream_lock:
+                self._active = False
+                self._abort = True
+                self._generation += 1
+                self._retire_isolated_clients()
+                # Old handlers retain only their old queue; they cannot consume
+                # any data from a subsequent session, even after a fast restart.
+                self._audio_queue = queue.Queue(maxsize=self._queue_capacity)
+            log.info("AirPlay 2 音频会话作废: generation=%s", self._generation)
+            return
         self._active = False
         self._abort = True
         while True:
@@ -172,7 +216,22 @@ class AudioStreamServer:
     _DROP_LOG_INTERVAL = 10.0
 
     def write_pcm(self, data: bytes):
-        """写入 PCM 音频数据，队列满时仅丢弃最旧的数据块"""
+        """Write PCM without blocking, dropping only the oldest block on overflow."""
+        if not self._isolate_sessions:
+            self._write_pcm_locked(data)
+            return
+        with self._stream_lock:
+            self._write_pcm_locked(data)
+
+    def write_timed_pcm(self, data: bytes, playtime_ns: int):
+        if self._output_latency_ns is None:
+            raise RuntimeError("timed PCM requires a clock-aware stream")
+        if not data or len(data) % (self._channels * self._sample_width):
+            raise ValueError("timed PCM must contain complete stereo frames")
+        with self._stream_lock:
+            self._write_pcm_locked(TimedPCM(data, playtime_ns))
+
+    def _write_pcm_locked(self, data: bytes):
         if not self._active:
             return
         try:
@@ -200,7 +259,7 @@ class AudioStreamServer:
             log.info(f"{self._label}: 流已停止，拒绝拉取 (404)")
             return web.Response(status=404, headers={"Connection": "close"})
         supplied = request.query.get("sid", "")
-        if not supplied or not secrets.compare_digest(supplied, self._session_id):
+        if not supplied.isascii() or not supplied or not secrets.compare_digest(supplied, self._session_id):
             log.warning(f"{self._label}: 拒绝无效音频流令牌")
             return web.Response(status=404, headers={"Connection": "close"})
         with self._client_lock:
@@ -226,6 +285,8 @@ class AudioStreamServer:
         )
 
     async def _handle_stream_wav(self, request: web.Request) -> web.StreamResponse:
+        if self._isolate_sessions:
+            return await self._handle_isolated_wav(request)
         rejected = self._authorize_stream_request(request)
         if rejected is not None:
             return rejected
@@ -363,6 +424,201 @@ class AudioStreamServer:
             pass
         log.info(f"{self._label}: WAV 音频流结束")
         return response
+
+    def _retire_isolated_clients(self):
+        """Called under _stream_lock, including from the PCM/control threads."""
+        for abort, loop, transport in self._isolated_clients.values():
+            abort.set()
+            if transport is not None and not loop.is_closed():
+                # Force-close instead of waiting for a stalled write or sending
+                # an EOF that the speaker could cache as a completed WAV file.
+                loop.call_soon_threadsafe(transport.abort)
+
+    def _request_clock_resync(self, generation, reason, seed=None):
+        callback = self.on_clock_resync
+        return bool(callback and callback(generation, reason, seed))
+
+    async def _handle_isolated_wav(self, request: web.Request) -> web.StreamResponse:
+        headers = {"Content-Type": "audio/wav", "Cache-Control": "no-cache, no-store",
+                   "Connection": "close"}
+        loop = asyncio.get_running_loop()
+        abort = threading.Event()
+        token = object()
+        transport = request.transport
+        with self._stream_lock:
+            if not self._active:
+                return web.Response(status=404, headers=headers)
+            supplied = request.query.get("sid", "")
+            if not supplied.isascii() or not supplied or not secrets.compare_digest(supplied, self._session_id):
+                log.info("AirPlay 2 拒绝无效或过期的音频流令牌")
+                return web.Response(status=410, headers=headers)
+            if request.method == "HEAD":
+                return web.Response(headers=headers)
+            with self._client_lock:
+                if self._client_count >= _MAX_STREAM_CLIENTS:
+                    return web.Response(status=429, headers=headers)
+                self._client_count += 1
+            # A retry may arrive before the previous GET disconnects. There is
+            # exactly one consumer, not two readers sharing a destructive queue.
+            self._retire_isolated_clients()
+            self._isolated_clients[token] = (abort, loop, transport)
+            generation = self._generation
+            audio_queue = self._audio_queue
+        started = last_report = time.monotonic()
+        written = 0
+        response = web.StreamResponse(headers=headers)
+        log.info("AirPlay 2 拉流开始: generation=%s peer=%s", generation, request.remote)
+        try:
+            await response.prepare(request)
+            await response.write(self._build_wav_header())
+            if self._output_latency_ns is not None:
+                written = await self._send_timed_wav(response, abort, generation, audio_queue, started)
+                return response
+            while not abort.is_set():
+                with self._stream_lock:
+                    if not self._active or generation != self._generation:
+                        break
+                    chunks = []
+                    for _ in range(32):
+                        try:
+                            chunk = audio_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        if chunk:
+                            chunks.append(chunk)
+                if not chunks:
+                    # Do not fabricate silence during a seek/pause. Session
+                    # termination comes from the control event, not this timer.
+                    await asyncio.sleep(0.01)
+                    continue
+                if abort.is_set():
+                    break
+                data = b"".join(chunks)
+                # No unbounded pending_data list. A slow client can retain only
+                # this bounded batch plus the bounded PCM queue.
+                await asyncio.wait_for(response.write(data), timeout=2.0)
+                written += len(data)
+                now = time.monotonic()
+                if now - last_report >= 1.0:
+                    log.info("AirPlay 2 拉流进度: generation=%s elapsed_ms=%.1f written_bytes=%s queue_chunks=%s",
+                             generation, (now - started) * 1000, written, audio_queue.qsize())
+                    last_report = now
+        except (ConnectionResetError, BrokenPipeError, asyncio.TimeoutError):
+            pass
+        finally:
+            unexpected_disconnect = not abort.is_set()
+            abort.set()
+            with self._stream_lock:
+                self._isolated_clients.pop(token, None)
+            self._release_stream_client()
+            if transport is not None:
+                transport.abort()
+            log.info("AirPlay 2 拉流结束: generation=%s elapsed_ms=%.1f written_bytes=%s",
+                     generation, (time.monotonic() - started) * 1000, written)
+            if self._output_latency_ns is not None and unexpected_disconnect:
+                self._request_clock_resync(generation, "http-disconnected-or-write-timeout")
+        return response
+
+    async def _send_timed_wav(self, response, abort, generation, audio_queue, started):
+        """Schedule each block against PTP, not HTTP connection age.
+
+        The Xiaomi DAC delay remains a calibrated estimate: this does NOT claim
+        device-clock feedback. Startup/cloud delay must never become PCM backlog.
+        """
+        pending = None
+        written = dropped = 0
+        last_report = time.monotonic()
+        last_shortfall_report = float('-inf')
+        first_pts_ns = None
+        first_lead_ns = None
+        frame_bytes = self._channels * self._sample_width
+        while not abort.is_set():
+            with self._stream_lock:
+                if not self._active or generation != self._generation:
+                    break
+                if pending is None:
+                    try:
+                        pending = audio_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+            if pending is None:
+                await asyncio.sleep(0.002)
+                continue
+            if not isinstance(pending, TimedPCM):
+                raise RuntimeError("untimed PCM on the PTP bridge")
+            now_ns = clock_ns()
+            target_ns = now_ns + self._output_latency_ns
+            lateness_ns = target_ns - pending.playtime_ns
+            # Exact catch-up at startup. During steady playback tolerate 80 ms
+            # scheduling/network jitter rather than cutting every late packet.
+            if written == 0 or lateness_ns > 80_000_000:
+                # A live sender may not supply enough future audio to meet the
+                # estimated Xiaomi latency. Do not discard every arriving block
+                # in that case: only catch up to the estimate when a replacement
+                # at that deadline is already queued. Otherwise discard actual
+                # expired audio, preserving future samples and reporting the
+                # unattainable lead rather than claiming clock lock.
+                with audio_queue.mutex:
+                    future_available = any(isinstance(item, TimedPCM) and
+                                           item.playtime_ns >= target_ns
+                                           for item in audio_queue.queue)
+                trim_ns = target_ns if future_available else now_ns
+                pending, trimmed = pending.trim_before(trim_ns)
+                dropped += trimmed
+                if pending is None:
+                    continue
+            wait_ns = pending.playtime_ns - self._output_latency_ns - clock_ns()
+            if wait_ns > 1_000_000:
+                await asyncio.sleep(min(wait_ns / 1_000_000_000, 0.01))
+                continue
+            if abort.is_set():
+                break
+            first = written == 0
+            lead_ns = pending.playtime_ns - clock_ns()
+            lead_ms = lead_ns / 1_000_000
+            # A WAV carries only sample count, not each block's PTP timestamp.
+            # Skipping PCM or changing the anchor in an existing response breaks
+            # that mapping even when future HTTP writes again meet their PTS.
+            # Compare against cumulative emitted frames (not prior packet only)
+            # so small discontinuities cannot accumulate unnoticed.
+            if first_pts_ns is not None:
+                expected_pts_ns = first_pts_ns + (written // frame_bytes) * 1_000_000_000 // self._sample_rate
+                shift_ns = pending.playtime_ns - expected_pts_ns
+                if abs(shift_ns) > 80_000_000:
+                    if self._request_clock_resync(generation, f"wav-timeline-shift:{shift_ns / 1_000_000:.1f}ms", pending):
+                        break
+            else:
+                first_pts_ns = pending.playtime_ns
+                first_lead_ns = lead_ns
+            # Continuous PTS does not imply continuous delivery: an underrun
+            # can leave the native WAV player permanently behind. Use this
+            # response's initial lead, not the configured estimate (a live
+            # sender may consistently provide less look-ahead).
+            if not first and first_lead_ns - lead_ns > 80_000_000:
+                if self._request_clock_resync(generation,
+                                              f"wav-send-late:{(first_lead_ns - lead_ns) / 1_000_000:.1f}ms", pending):
+                    break
+            if (self._output_latency_ns / 1_000_000 - lead_ms > 80 and
+                    time.monotonic() - last_shortfall_report >= 1):
+                log.warning("AirPlay 2 提前量不足: generation=%s available_lead_ms=%.1f required_lead_ms=%.1f; 保留未过期音频，尚未同步",
+                            generation, lead_ms, self._output_latency_ns / 1_000_000)
+                last_shortfall_report = time.monotonic()
+            await asyncio.wait_for(response.write(pending.data), timeout=0.25)
+            written += len(pending.data)
+            if first:
+                log.info("AirPlay 2 时钟首帧: generation=%s pts_lead_ms=%.1f output_latency_ms=%.1f skipped_ms=%.1f",
+                         generation, lead_ms, self._output_latency_ns / 1_000_000,
+                         dropped * 1000 / self._sample_rate)
+            pending = None
+            now = time.monotonic()
+            if now - last_report >= 1:
+                log.info("AirPlay 2 时钟拉流: generation=%s elapsed_ms=%.1f written_bytes=%s queue_chunks=%s pts_lead_ms=%.1f skipped_ms=%.1f",
+                         generation, (now - started) * 1000, written, audio_queue.qsize(),
+                         lead_ms, dropped * 1000 / self._sample_rate)
+                last_report = now
+        log.info("AirPlay 2 时钟拉流结束: generation=%s written_bytes=%s skipped_ms=%.1f",
+                 generation, written, dropped * 1000 / self._sample_rate)
+        return written
 
     async def _handle_stream_mp3(self, request: web.Request) -> web.StreamResponse:
         rejected = self._authorize_stream_request(request)

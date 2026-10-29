@@ -85,6 +85,16 @@ class Config:
     cookie: str = ""
     hostname: str = ""
     dlna_port: int = 8200
+    # AirPlay 协议模式。AirPlay 2 由 shairport-sync + NQPTP 接收，
+    # 测试版在一个 IP 上只启动一个接收器；这不限制与其他 IP 的设备组播。
+    # 环境变量只提供新配置的默认值，不覆盖 Web 后台保存的模式。
+    airplay_mode: str = field(default_factory=lambda: os.getenv("MIAIR_AIRPLAY_MODE", "airplay1"))
+    airplay2_target_did: str = ""
+    airplay2_port: int = 7000
+    # HTTP-write to acoustic output estimate. Higher values send PCM earlier.
+    # The default matches the former stdout backend's nominal 1 s lead, not a
+    # measured Xiaomi delay. Calibrate against a known-good AirPlay 2 receiver.
+    airplay2_output_latency_ms: int = 1000
     web_port: int = 8300
     conf_path: str = "conf"
     verbose: bool = False
@@ -135,6 +145,10 @@ class Config:
 
     def __post_init__(self):
         self.resume_delay_seconds = max(1, min(15, self.resume_delay_seconds))
+        if self.airplay_mode not in ("airplay1", "airplay2"):
+            self.airplay_mode = "airplay1"
+        self.airplay2_port = max(1, min(65535, self.airplay2_port))
+        self.airplay2_output_latency_ms = max(0, min(4000, self.airplay2_output_latency_ms))
         if not self.account:
             self.account = os.getenv("MI_USER", "")
         if not self.password:

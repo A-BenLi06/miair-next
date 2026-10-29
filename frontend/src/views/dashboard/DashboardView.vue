@@ -54,6 +54,9 @@
       <n-list v-else>
         <n-list-item v-for="sp in status.speakers" :key="sp.did">
           <n-thing :title="sp.dlna_name">
+            <template v-if="sp.airplay_active && sp.now_playing?.artwork_id" #avatar>
+              <AirplayArtwork :did="sp.did" :artwork-id="sp.now_playing.artwork_id" />
+            </template>
             <template #description>
               <n-space :size="8">
                 <n-tag :type="sp.transport_state === 'PLAYING' ? 'success' : 'default'" size="small">
@@ -75,29 +78,29 @@
             </div>
             <div v-if="sp.current_uri" class="uri">{{ sp.current_uri }}</div>
             <n-space
-              v-if="sp.airplay_audio && (sp.airplay_active || sp.airplay_audio.rtp_packets_received > 0)"
+              v-if="sp.airplay_audio && (sp.airplay_active || (sp.airplay_audio.rtp_packets_received ?? 0) > 0)"
               :size="6"
               style="margin-top: 8px"
             >
-              <n-tag size="small" :type="sp.airplay_audio.rtp_packets_received ? 'success' : 'warning'">
+              <n-tag v-if="sp.airplay_audio.rtp_packets_received != null" size="small" :type="sp.airplay_audio.rtp_packets_received ? 'success' : 'warning'">
                 RTP {{ sp.airplay_audio.rtp_packets_received }} 包
               </n-tag>
-              <n-tag size="small" :type="sp.airplay_audio.decode_errors ? 'error' : 'success'">
+              <n-tag v-if="sp.airplay_audio.decode_errors != null" size="small" :type="sp.airplay_audio.decode_errors ? 'error' : 'success'">
                 解码错误 {{ sp.airplay_audio.decode_errors }}
               </n-tag>
-              <n-tag size="small" :type="sp.airplay_audio.decode_success ? 'success' : 'warning'">
+              <n-tag v-if="sp.airplay_audio.decode_success != null" size="small" :type="sp.airplay_audio.decode_success ? 'success' : 'warning'">
                 解码成功 {{ sp.airplay_audio.decode_success }}
               </n-tag>
               <n-tag size="small" :type="sp.airplay_audio.stream_clients ? 'success' : 'warning'">
                 音箱拉流 {{ sp.airplay_audio.stream_clients ? '已连接' : '未连接' }}
               </n-tag>
-              <n-tag size="small" :type="sp.airplay_audio.rtp_queue_drops ? 'warning' : 'default'">
+              <n-tag v-if="sp.airplay_audio.rtp_queue_drops != null" size="small" :type="sp.airplay_audio.rtp_queue_drops ? 'warning' : 'default'">
                 RTP 队列丢包 {{ sp.airplay_audio.rtp_queue_drops }}
               </n-tag>
-              <n-tag size="small" :type="sp.airplay_audio.decrypt_failures ? 'error' : 'default'">
+              <n-tag v-if="sp.airplay_audio.decrypt_failures != null" size="small" :type="sp.airplay_audio.decrypt_failures ? 'error' : 'default'">
                 解密失败 {{ sp.airplay_audio.decrypt_failures }}
               </n-tag>
-              <n-tag size="small" :type="sp.airplay_audio.lost_frames_filled ? 'warning' : 'default'">
+              <n-tag v-if="sp.airplay_audio.lost_frames_filled != null" size="small" :type="sp.airplay_audio.lost_frames_filled ? 'warning' : 'default'">
                 补静音帧 {{ sp.airplay_audio.lost_frames_filled }}
               </n-tag>
               <n-tag size="small" type="default">
@@ -134,6 +137,7 @@ import {
   NAlert, NText,
 } from 'naive-ui'
 import { useWebSocket } from '@/composables/useWebSocket'
+import AirplayArtwork from '@/components/AirplayArtwork.vue'
 import { fetchStatus, type SystemStatus } from '@/api/system'
 import { spotifyTag, spotifyTrackText } from '@/utils/spotifyStatus'
 import type { NowPlaying } from '@/composables/useWebSocket'
