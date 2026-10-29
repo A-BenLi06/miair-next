@@ -635,6 +635,10 @@ class DLNARenderer:
                 audio_id = await self._resolve_audio_id()
                 async with self._lock:
                     self.transport_state = TRANSPORT_STATE_TRANSITIONING
+                # abort_proxy_func 会屏蔽该 UDN 的新代理请求。音箱收到播放命令
+                # 后可能立即拉流，因此必须在发送命令前解除屏蔽。
+                if self.resume_proxy_func:
+                    self.resume_proxy_func(self.udn)
                 success = await self.speaker.play_url(play_url, audio_id)
                 async with self._lock:
                     if success:
@@ -688,6 +692,8 @@ class DLNARenderer:
         """设置下一首的 URI"""
         self.next_uri = uri
         self.next_uri_metadata = metadata
+        if uri and self.pre_buffer_func:
+            self.pre_buffer_func(uri)
         log.info(f"[{self.friendly_name}] SetNextAVTransportURI: {uri}")
 
     def get_current_transport_actions(self) -> str:

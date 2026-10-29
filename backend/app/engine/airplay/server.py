@@ -867,7 +867,7 @@ class AirPlayServer:
                                 except ValueError: pass
                     log.info(f"RTSP FLUSH: seq={flush_seq} rtptime={flush_rtptime}")
                     # 清空音频缓冲区但不停止流服务器
-                    self._stream_server.start_streaming()
+                    self._stream_server.start_streaming(new_session=False)
                     # 通知 RTP 接收线程重置 jitter buffer
                     self._flush_flag.set()
                     # 响应中返回当前接收端的 RTP 状态
@@ -879,7 +879,7 @@ class AirPlayServer:
                     # FLUSHBUFFERED 用于 buffered 模式，包含 from_seq/until_seq 范围
                     rtp_info = headers.get("RTP-Info", "")
                     log.info(f"RTSP FLUSHBUFFERED: RTP-Info={rtp_info}")
-                    self._stream_server.start_streaming()
+                    self._stream_server.start_streaming(new_session=False)
                     self._flush_flag.set()
                     self._send_rtsp_response(sock, 200, cseq, {
                         "RTP-Info": f"seq={self._last_rtp_seq};rtptime={self._last_rtp_timestamp}",

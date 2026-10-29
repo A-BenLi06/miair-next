@@ -358,11 +358,12 @@ class TestInterruptBehaviour:
             receiver._is_active = True
             receiver._speaker_active = True
             receiver._playback_status = "playing"
-            receiver._stream_url = "http://127.0.0.1:9/spotify/stream.wav"
+            receiver._stream_url = "http://127.0.0.1:9/spotify/stream.wav?sid=stream-secret"
             await receiver._resume_after_interrupt()
 
             assert controller.played, "应重新向音箱推流"
-            assert "sid=" in controller.played[0]
+            assert "sid=stream-secret" in controller.played[0]
+            assert "_=" in controller.played[0]
             assert receiver._ws.sent == [], "开启自动恢复时不应暂停 Spotify"
 
         asyncio.run(scenario())

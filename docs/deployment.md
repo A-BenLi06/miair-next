@@ -66,6 +66,7 @@ docker compose up -d
 ```
 data/
 ├── conf/          # 引擎业务配置 (config.json / .mi.token / miair.log)
+│   ├── enc.key    # config.json 敏感字段加密密钥
 ├── miair.db       # SQLite (管理员账号)
 ├── secret.key     # JWT 密钥 (首次启动随机生成)
 └── spotify/       # Spotify 畅联 (可选)
@@ -74,7 +75,7 @@ data/
     └── cache/     # 播放缓存
 ```
 
-> ⚠️ **凭据存储**: `conf/config.json` 以明文保存小米账号密码 / Cookie，`conf/.mi.token` 保存 serviceToken。程序在每次保存配置与登录成功后会自动把这两个文件的权限收紧为 `600`（仅属主可读写，`secret.key` 亦同），但仍请妥善保护数据目录：不要放在公开可读的共享路径，备份文件注意加密存放。
+> ⚠️ **凭据存储**: `conf/config.json` 中的小米账号密码、Cookie、飞书 Webhook、Spotify API Key 等敏感字段使用 AES-GCM 加密；`conf/enc.key` 必须与配置一起备份。`.mi.token` 仍包含明文 serviceToken，文件权限限制为 `600`。`enc.key` 与配置位于同一目录，因此整个数据目录或备份仍应妥善保护并加密存放。
 
 ## 环境变量
 

@@ -50,7 +50,7 @@ async def get_settings_api(
         "follow_device_volume": config.follow_device_volume,
         "auto_restart": config.auto_restart,
         "notify_type": config.notify_type,
-        "notify_feishu_webhook": config.notify_feishu_webhook,
+        "notify_feishu_webhook": mask_secret(config.notify_feishu_webhook),
         "notify_feishu_secret": mask_secret(config.notify_feishu_secret),
         "notify_wxpusher_spt": mask_secret(config.notify_wxpusher_spt),
         "need_use_play_music_api": NEED_USE_PLAY_MUSIC_API,
@@ -123,7 +123,9 @@ async def save_settings_api(
     if payload.notify_type is not None:
         config.notify_type = payload.notify_type.strip()
     if payload.notify_feishu_webhook is not None:
-        config.notify_feishu_webhook = payload.notify_feishu_webhook.strip()
+        config.notify_feishu_webhook = unmask_secret(
+            payload.notify_feishu_webhook.strip(), config.notify_feishu_webhook
+        )
     if payload.notify_feishu_secret is not None:
         # 回写的是脱敏占位符 (未修改) 时保留已存储的真实密钥
         config.notify_feishu_secret = unmask_secret(

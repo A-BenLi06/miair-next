@@ -6,7 +6,7 @@ ARG NPM_REGISTRY=
 WORKDIR /web
 COPY frontend/package.json frontend/package-lock.json* ./
 RUN if [ -n "$NPM_REGISTRY" ]; then npm config set registry "$NPM_REGISTRY"; fi \
-    && npm install
+    && npm ci --no-audit --no-fund
 COPY frontend/ ./
 RUN npm run build
 

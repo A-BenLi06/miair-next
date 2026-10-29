@@ -9,10 +9,12 @@
 import asyncio
 import logging
 import queue
+import secrets
 import struct
 import subprocess
 import threading
 import time
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from aiohttp import web
 
@@ -20,6 +22,15 @@ log = logging.getLogger("miair")
 
 # 缓冲队列上限（约 800ms，兼顾抗抖动与实时性）
 _QUEUE_MAXSIZE = 100
+_MAX_STREAM_CLIENTS = 4
+
+
+def with_cache_buster(url: str) -> str:
+    """Append a cache-busting value while preserving the stream access token."""
+    parts = urlsplit(url)
+    query = [(key, value) for key, value in parse_qsl(parts.query) if key != "_"]
+    query.append(("_", str(time.time_ns())))
+    return urlunsplit(parts._replace(query=urlencode(query)))
 
 
 class AudioStreamServer:
@@ -54,7 +65,7 @@ class AudioStreamServer:
         self._sample_width = 2
         self._active = False
         self._abort = False
-        self._session_id = int(time.time())
+        self._session_id = secrets.token_urlsafe(32)
         self._client_count = 0
         self._client_lock = threading.Lock()
 
@@ -106,10 +117,12 @@ class AudioStreamServer:
         self._channels = channels
         self._sample_width = sample_width
 
-    def start_streaming(self):
+    def start_streaming(self, *, new_session: bool = True):
+        """开始或重置接收音频；只有新播放会话才轮换拉流令牌。"""
         self._active = True
         self._abort = False
-        self._session_id = int(time.time())
+        if new_session:
+            self._session_id = secrets.token_urlsafe(32)
         while True:
             try:
                 self._audio_queue.get_nowait()
@@ -156,12 +169,24 @@ class AudioStreamServer:
                 self._last_drop_log = now
                 log.warning(f"{self._label} 音频队列溢出: 丢弃最旧 {dropped} 块 (~{dropped * 8}ms)")
 
-    def _reject_if_inactive(self) -> web.Response | None:
-        """流停止后返回 404，防止音箱因空响应重复重连"""
+    def _authorize_stream_request(self, request: web.Request) -> web.Response | None:
+        """验证流会话令牌，并限制同时拉流数。"""
         if not self._active:
             log.info(f"{self._label}: 流已停止，拒绝拉取 (404)")
             return web.Response(status=404, headers={"Connection": "close"})
+        supplied = request.query.get("sid", "")
+        if not supplied or not secrets.compare_digest(supplied, self._session_id):
+            log.warning(f"{self._label}: 拒绝无效音频流令牌")
+            return web.Response(status=404, headers={"Connection": "close"})
+        with self._client_lock:
+            if self._client_count >= _MAX_STREAM_CLIENTS:
+                return web.Response(status=429, headers={"Connection": "close"})
+            self._client_count += 1
         return None
+
+    def _release_stream_client(self) -> None:
+        with self._client_lock:
+            self._client_count = max(0, self._client_count - 1)
 
     def _build_wav_header(self, data_size: int = 0x7FFFFF00) -> bytes:
         byte_rate = self._sample_rate * self._channels * self._sample_width
@@ -176,15 +201,20 @@ class AudioStreamServer:
         )
 
     async def _handle_stream_wav(self, request: web.Request) -> web.StreamResponse:
+        rejected = self._authorize_stream_request(request)
+        if rejected is not None:
+            return rejected
+        try:
+            return await self._stream_wav_authorized(request)
+        finally:
+            self._release_stream_client()
+
+    async def _stream_wav_authorized(self, request: web.Request) -> web.StreamResponse:
         """WAV 模式: 直接输出 PCM 数据，零编码延迟
 
         使用专用写入线程从队列批量读取数据，通过 asyncio 事件写回 HTTP 响应，
         避免每个包都经过 asyncio.to_thread 的调度开销。
         """
-        rejected = self._reject_if_inactive()
-        if rejected is not None:
-            return rejected
-
         response = web.StreamResponse(
             status=200,
             headers={
@@ -205,8 +235,6 @@ class AudioStreamServer:
                 import socket as _sock
                 sock.setsockopt(_sock.IPPROTO_TCP, _sock.TCP_NODELAY, 1)
 
-        with self._client_lock:
-            self._client_count += 1
         self._abort = False
 
         log.info(f"{self._label}: 音箱开始拉取 WAV 音频流 (零编码延迟)")
@@ -277,8 +305,6 @@ class AudioStreamServer:
             pass
         finally:
             conn_abort.set()
-            with self._client_lock:
-                self._client_count -= 1
 
         try:
             await response.write_eof()
@@ -288,9 +314,15 @@ class AudioStreamServer:
         return response
 
     async def _handle_stream_mp3(self, request: web.Request) -> web.StreamResponse:
-        rejected = self._reject_if_inactive()
+        rejected = self._authorize_stream_request(request)
         if rejected is not None:
             return rejected
+        try:
+            return await self._stream_mp3_authorized(request)
+        finally:
+            self._release_stream_client()
+
+    async def _stream_mp3_authorized(self, request: web.Request) -> web.StreamResponse:
 
         response = web.StreamResponse(
             status=200,
@@ -311,8 +343,6 @@ class AudioStreamServer:
                 import socket as _sock
                 sock.setsockopt(_sock.IPPROTO_TCP, _sock.TCP_NODELAY, 1)
 
-        with self._client_lock:
-            self._client_count += 1
         self._abort = False
         conn_abort = threading.Event()
 
@@ -355,8 +385,6 @@ class AudioStreamServer:
             )
         except FileNotFoundError:
             log.error("ffmpeg 未找到，无法转码音频流")
-            with self._client_lock:
-                self._client_count -= 1
             await response.write_eof()
             return response
 
@@ -436,9 +464,6 @@ class AudioStreamServer:
                     proc.wait(timeout=2)
                 except Exception:
                     pass
-
-        with self._client_lock:
-            self._client_count -= 1
 
         try:
             await response.write_eof()

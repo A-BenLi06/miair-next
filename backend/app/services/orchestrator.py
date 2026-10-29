@@ -52,6 +52,7 @@ class Orchestrator:
         self._visibility_task: asyncio.Task | None = None
         self._offline_speakers: set[str] = set()
         self._device_check_task: asyncio.Task | None = None
+        self._startup_task: asyncio.Task | None = None
         # 重启串行化: 防止连续扫码/保存设置触发多个 restart 并发互相踩踏
         self._restart_lock = asyncio.Lock()
         # 最近一次「凭据恢复」触发的重启时间: 节流防重启风暴 (restart 会新建
@@ -110,20 +111,24 @@ class Orchestrator:
                 log.warning(f"定期检查设备列表异常: {e}")
 
     async def start(self):
-        """启动所有服务"""
+        """快速返回并在后台启动外部服务，避免阻塞 Web 管理接口启动。"""
         log.info("MiAir Next 启动中...")
         log.info(f"主机名: {self.config.hostname}")
         log.info(f"DLNA 端口: {self.config.dlna_port}")
 
-        if (self.config.account or self.config.cookie) and self.config.mi_did:
-            await self._start_dlna_services()
-        else:
-            if not self.config.account and not self.config.cookie:
-                log.info("未配置小米账号, 请打开 Web 管理界面进行配置")
-            elif not self.config.mi_did:
-                log.info("未选择音箱设备, 请打开 Web 管理界面选择设备")
-
+        self._startup_task = asyncio.create_task(self._initialize_services())
         self._device_check_task = asyncio.create_task(self._periodic_device_check())
+
+    async def _initialize_services(self):
+        """初始化第三方服务，并与设置触发的热重启串行执行。"""
+        async with self._restart_lock:
+            if (self.config.account or self.config.cookie) and self.config.mi_did:
+                await self._start_dlna_services()
+            else:
+                if not self.config.account and not self.config.cookie:
+                    log.info("未配置小米账号, 请打开 Web 管理界面进行配置")
+                elif not self.config.mi_did:
+                    log.info("未选择音箱设备, 请打开 Web 管理界面选择设备")
 
     async def _on_auth_recovered(self):
         """凭据由失效自动恢复后的回调: 重建 DLNA/AirPlay 服务
@@ -131,6 +136,11 @@ class Orchestrator:
         三级降级链 (尤其账号密码重登) 可能在 DLNA 已停摆期间恢复凭据,
         此时必须重新拉起服务, 否则音箱在手机上仍然不可见。
         """
+        # 初始化期间的凭据恢复由当前启动流程继续处理；AuthManager 会在独立任务
+        # 中触发回调，若此时排队获取重启锁，可能在启动完成后造成不必要的二次重启。
+        startup_task = getattr(self, "_startup_task", None)
+        if startup_task is not None and not startup_task.done():
+            return
         if self.dlna_running:
             return
         elapsed = time.time() - self._last_recovery_restart
@@ -356,6 +366,7 @@ class Orchestrator:
         self._spotify_watch_task = None
         if task is not None and task is not asyncio.current_task() and not task.done():
             task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         if self.spotify is not None:
             try:
                 await self.spotify.stop()
@@ -504,15 +515,23 @@ class Orchestrator:
         """停止所有服务"""
         log.info("MiAir Next 正在关闭...")
 
+        startup_task = self._startup_task
+        self._startup_task = None
+        if startup_task and startup_task is not asyncio.current_task() and not startup_task.done():
+            startup_task.cancel()
+            await asyncio.gather(startup_task, return_exceptions=True)
+
         if self._device_check_task:
             self._device_check_task.cancel()
+            await asyncio.gather(self._device_check_task, return_exceptions=True)
             self._device_check_task = None
 
-        await self._stop_dlna_services()
-        if self.airplay_manager:
-            await self.airplay_manager.stop()
-            self.airplay_manager = None
-        await self._stop_spotify()
-        await self.auth.close()
+        async with self._restart_lock:
+            await self._stop_dlna_services()
+            if self.airplay_manager:
+                await self.airplay_manager.stop()
+                self.airplay_manager = None
+            await self._stop_spotify()
+            await self.auth.close()
 
         log.info("MiAir Next 已关闭")

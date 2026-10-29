@@ -64,15 +64,15 @@ docker build -t miair-next:local .
 
 ## 发版流程
 
-1. 同步修改版本号(两处需一致):`backend/app/engine/const.py` 的 `VERSION`(`__init__.py` 从此处导出)与 `backend/pyproject.toml` 的 `version`,提交并推送 `main`
+1. 同步修改所有发布渠道的应用版本号为同一 SemVer:后端 `backend/app/engine/const.py`、`backend/pyproject.toml`,前端 `frontend/package.json` 与 lockfile、FNOS `fnos/manifest`、iStore 的 `PKG_VERSION`。提交并推送 `main`
 2. 打语义化 tag 并推送:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.9.1
+git push origin v0.9.1
 ```
 
-CI 自动完成:构建推送 Docker 镜像(`latest` / `0.1.0` / `0.1` / `<sha>`)+ 创建 GitHub Release(供「检查更新」检测)。
+CI 自动完成:构建推送 Docker 镜像(`latest` / `0.9.1` / `0.9` / `<sha>`)+ 创建 GitHub Release(供「检查更新」检测)。
 
 ## 项目结构
 

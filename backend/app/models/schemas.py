@@ -18,6 +18,8 @@ class TokenResponse(BaseModel):
 
 def _require_password_strength(value: str) -> str:
     """面板可暴露公网, 阻止纯数字/纯字母弱口令"""
+    if len(value.encode("utf-8")) > 72:
+        raise ValueError("密码 UTF-8 编码长度不能超过 72 字节")
     if not any(c.isalpha() for c in value) or not any(c.isdigit() for c in value):
         raise ValueError("密码需同时包含字母和数字")
     return value

@@ -2,7 +2,7 @@
 
 include $(TOPDIR)/rules.mk
 
-PKG_VERSION:=1.0.3-r20260821
+PKG_VERSION:=0.9.1
 PKG_RELEASE:=1
 
 define Package/$(PKG_NAME)/conffiles

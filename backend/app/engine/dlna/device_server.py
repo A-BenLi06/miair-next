@@ -22,7 +22,7 @@ from app.engine.const import (
 )
 from app.engine.dlna.eventing import EventManager, build_last_change_event, clamp_timeout
 from app.engine.dlna.duration import probe_duration as probe_audio_duration
-from app.engine.dlna.media_buffer import MediaBuffer
+from app.engine.dlna.media_buffer import MediaBuffer, _MAX_DOWNLOAD_SIZE
 from app.engine.dlna.cover import (
     default_cover_asset_path,
 )
@@ -39,6 +39,7 @@ from app.engine.dlna.templates import (
     device_description_xml,
     soap_fault,
 )
+from app.engine.net_guard import SafeResolver
 
 log = logging.getLogger("miair")
 
@@ -89,6 +90,7 @@ class DeviceServer:
         self._resume_tasks: dict[str, asyncio.Task] = {}  # udn -> resume task
         # 追踪活跃的代理任务，用于强制中止
         self._active_proxy_tasks: dict[str, set[asyncio.Task]] = {} # udn -> set of tasks
+        self._active_proxy_buffers: dict[asyncio.Task, str] = {}
         # 暂停中屏蔽集合：暂停时加入，播放/停止时移除，阻止音箱重连拉取音频
         self._paused_proxy_udns: set[str] = set()
         # 周期性缓冲清理任务
@@ -142,6 +144,7 @@ class DeviceServer:
             connector = aiohttp.TCPConnector(
                 limit=50,  # 连接池上限（默认100太大，10太小会卡住多线程下载）
                 ttl_dns_cache=300,  # DNS 缓存 5 分钟
+                resolver=SafeResolver(),
             )
             self._proxy_session = aiohttp.ClientSession(
                 connector=connector,
@@ -180,7 +183,9 @@ class DeviceServer:
             buf = self._media_buffers.get(self._url_to_buffer[remote_url])
             if buf and not buf.error:
                 return  # 已在缓冲
-        self._cleanup_old_buffers()
+        if not self._cleanup_old_buffers():
+            log.warning(f"缓冲资源不足，跳过预缓冲: {remote_url[:80]}...")
+            return
         buffer_id = secrets.token_urlsafe(16)
         buf = MediaBuffer(remote_url)
         self._media_buffers[buffer_id] = buf
@@ -201,7 +206,10 @@ class DeviceServer:
                 return url
 
         # 创建新缓冲
-        self._cleanup_old_buffers()
+        if not self._cleanup_old_buffers():
+            # 代理容量不足时保留现有播放，音箱尝试直接读取原始 URL。
+            log.warning(f"缓冲资源不足，回退到原始媒体 URL: {remote_url[:80]}...")
+            return remote_url
         buffer_id = secrets.token_urlsafe(16)
         buf = MediaBuffer(remote_url)
         self._media_buffers[buffer_id] = buf
@@ -248,7 +256,9 @@ class DeviceServer:
         # 如果找不到缓冲，尝试创建新缓冲
         if not buffer_id:
             log.info("Seek: 未找到缓冲，尝试创建新缓冲...")
-            self._cleanup_old_buffers()
+            if not self._cleanup_old_buffers():
+                log.warning("缓冲资源不足，跳过 Seek 缓冲创建")
+                return None
             buffer_id = secrets.token_urlsafe(16)
             buf = MediaBuffer(original_url)
             self._media_buffers[buffer_id] = buf
@@ -322,7 +332,9 @@ class DeviceServer:
         seek_buf.download_complete = True
         seek_buf._complete_event.set()
 
-        self._cleanup_old_buffers()
+        if not self._cleanup_old_buffers():
+            log.warning("缓冲资源不足，无法保留 Seek 结果")
+            return None
         seek_bid = secrets.token_urlsafe(16)
         self._media_buffers[seek_bid] = seek_buf
         self._buffer_created_time[seek_bid] = time.time()
@@ -643,19 +655,61 @@ class DeviceServer:
                 return bytearray(data[i:])
         return None
 
-    def _cleanup_old_buffers(self):
-        """清理旧缓冲，保持数量不超过 _MAX_BUFFERS 且内存不超限"""
+    def _cleanup_old_buffers(self) -> bool:
+        """先淘汰闲置缓冲，再判断新下载是否有预留空间。"""
         while len(self._media_buffers) >= _MAX_BUFFERS:
-            oldest_id = next(iter(self._media_buffers))
+            oldest_id = next(
+                (bid for bid in self._media_buffers if not self._buffer_is_in_use(bid)),
+                None,
+            )
+            if oldest_id is None:
+                log.warning("缓冲数量达到上限，所有缓冲都正在使用；暂时保留活跃缓冲")
+                break
             self._remove_buffer(oldest_id)
         # 按内存上限清理
         self._cleanup_by_memory()
+        if len(self._media_buffers) >= _MAX_BUFFERS:
+            return False
+        # 未知文件大小按单文件上限预留，防止多个并发下载突破总内存预算。
+        return self._reserved_buffer_memory() + _MAX_DOWNLOAD_SIZE <= self._max_buffer_memory
+
+    def _reserved_buffer_memory(self) -> int:
+        """已完成缓冲按实际大小计，进行中的下载按单文件上限预留。"""
+        return sum(
+            len(buf.data)
+            if buf.download_complete or buf.error
+            else max(len(buf.data), _MAX_DOWNLOAD_SIZE)
+            for buf in self._media_buffers.values()
+        )
+
+    def _buffer_is_in_use(self, buffer_id: str) -> bool:
+        """当前播放/下一首或 HTTP 代理请求持有的缓冲不能被淘汰。"""
+        if buffer_id in self._active_proxy_buffers.values():
+            return True
+        buf = self._media_buffers.get(buffer_id)
+        if buf is None:
+            return False
+        source_url = buf.remote_url
+        if self._url_to_buffer.get(source_url) != buffer_id:
+            return False
+        return any(
+            renderer.current_uri == source_url or renderer.next_uri == source_url
+            for renderer in self.renderers.values()
+        )
 
     def _cleanup_by_memory(self):
         """清理缓冲直到总内存用量低于上限"""
         total_mem = sum(len(buf.data) for buf in self._media_buffers.values())
         while total_mem > self._max_buffer_memory and self._media_buffers:
-            oldest_id = next(iter(self._media_buffers))
+            oldest_id = next(
+                (bid for bid in self._media_buffers if not self._buffer_is_in_use(bid)),
+                None,
+            )
+            if oldest_id is None:
+                log.warning(
+                    "缓冲内存超过上限，但剩余缓冲都正在使用；保留播放流以避免中断"
+                )
+                break
             buf = self._media_buffers.get(oldest_id)
             freed = len(buf.data) if buf else 0
             self._remove_buffer(oldest_id)
@@ -748,6 +802,8 @@ class DeviceServer:
                         la = self._buffer_last_accessed.get(bid, 0)
                         if la > 0 and (now - la) < 120:
                             continue
+                        if self._buffer_is_in_use(bid):
+                            continue
                         self._remove_buffer(bid)
                 # 内存上限检查
                 self._cleanup_by_memory()
@@ -820,9 +876,11 @@ class DeviceServer:
             # 永久留下一个空 set (原实现只 discard 不删 key, 属缓慢泄漏)。
             tasks = self._active_proxy_tasks.setdefault(udn, set())
             tasks.add(current_task)
+            self._active_proxy_buffers[current_task] = buffer_id
 
             def _untrack(t, _udn=udn, _tasks=tasks):
                 _tasks.discard(t)
+                self._active_proxy_buffers.pop(t, None)
                 if not _tasks and self._active_proxy_tasks.get(_udn) is _tasks:
                     self._active_proxy_tasks.pop(_udn, None)
 
@@ -1221,7 +1279,7 @@ class DeviceServer:
         callback_url = callback.strip("<>")
         timeout = self._parse_timeout(request.headers.get("TIMEOUT", ""))
 
-        sid = event_manager.subscribe(callback_url, timeout)
+        sid = await event_manager.subscribe(callback_url, timeout)
         if sid is None:
             return web.Response(status=400)
 
@@ -1564,6 +1622,7 @@ class DeviceServer:
             except Exception as e:  # noqa: BLE001
                 log.warning(f"停止 DLNA EventManager 失败: {e}")
         self._cleanup_all_buffers()
+        self._active_proxy_buffers.clear()
         if self._proxy_session and not self._proxy_session.closed:
             await self._proxy_session.close()
         if self._runner:

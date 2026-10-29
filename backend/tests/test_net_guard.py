@@ -8,7 +8,9 @@
 import pytest
 
 from app.engine.net_guard import (
+    SafeResolver,
     UnsafeURLError,
+    _is_blocked_ip,
     assert_host_safe,
     validate_url_scheme,
 )
@@ -69,6 +71,28 @@ class TestHostSafety:
         with pytest.raises(UnsafeURLError):
             assert_host_safe(host)
 
+    def test_ipv4_mapped_ipv6_loopback_is_blocked(self):
+        assert _is_blocked_ip("::ffff:127.0.0.1")
+
+    def test_resolver_rechecks_address_used_by_connector(self):
+        import asyncio
+        import socket
+
+        class StubResolver(SafeResolver):
+            async def _lookup(self, host, port, family):
+                return [
+                    (
+                        socket.AF_INET,
+                        socket.SOCK_STREAM,
+                        socket.IPPROTO_TCP,
+                        "",
+                        ("127.0.0.1", port),
+                    )
+                ]
+
+        with pytest.raises(UnsafeURLError):
+            asyncio.run(StubResolver().resolve("rebind.example", 80))
+
     def test_localhost_resolves_to_loopback(self):
         """域名解析到 loopback 必须拒绝 (防 DNS 绕过的第一步)"""
         with pytest.raises(UnsafeURLError):
@@ -114,14 +138,20 @@ class TestCallbackValidationIntegrated:
     """eventing.validate_callback_url 应复用 host 校验"""
 
     def test_loopback_callback_rejected(self):
+        import asyncio
+
         from app.engine.dlna.eventing import validate_callback_url
 
-        assert validate_callback_url("<http://127.0.0.1:30000/cb>") is None
+        assert asyncio.run(validate_callback_url("<http://127.0.0.1:30000/cb>")) is None
 
     def test_private_callback_accepted(self):
+        import asyncio
+
         from app.engine.dlna.eventing import validate_callback_url
 
         assert (
-            validate_callback_url("<http://192.168.1.5:30000/callback>")
+            asyncio.run(
+                validate_callback_url("<http://192.168.1.5:30000/callback>")
+            )
             == "http://192.168.1.5:30000/callback"
         )

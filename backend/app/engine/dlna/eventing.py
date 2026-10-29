@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 import aiohttp
 from xml.sax.saxutils import escape
 
-from app.engine.net_guard import UnsafeURLError, assert_host_safe
+from app.engine.net_guard import SafeResolver, UnsafeURLError, validate_url_safe
 
 log = logging.getLogger("miair")
 
@@ -27,7 +27,7 @@ def clamp_timeout(seconds: int) -> int:
     return max(_TIMEOUT_MIN, min(int(seconds), _TIMEOUT_MAX))
 
 
-def validate_callback_url(url: str) -> str | None:
+async def validate_callback_url(url: str) -> str | None:
     """校验 SUBSCRIBE 的 CALLBACK: 仅接受 http(s) 且目标 IP 安全的 URL
 
     控制点 (BubbleUPnP 等) 位于局域网私网段, 属合法目标不拒绝;
@@ -37,11 +37,18 @@ def validate_callback_url(url: str) -> str | None:
     if not url or len(url) > _CALLBACK_MAX_LEN:
         return None
     parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
         return None
     try:
-        assert_host_safe(parsed.hostname)
-    except UnsafeURLError:
+        # DNS 解析在线程池执行，避免 SUBSCRIBE 请求阻塞事件循环。
+        await validate_url_safe(url)
+        parsed.port  # 触发对非法端口文本的标准库校验
+    except (UnsafeURLError, ValueError):
         return None
     return url
 
@@ -78,7 +85,9 @@ class EventManager:
     def _get_session(self) -> aiohttp.ClientSession:
         """获取或创建持久 HTTP session"""
         if self._session is None or self._session.closed:
+            connector = aiohttp.TCPConnector(resolver=SafeResolver(), limit=32)
             self._session = aiohttp.ClientSession(
+                connector=connector,
                 timeout=aiohttp.ClientTimeout(total=5)
             )
         self._session_idle_since = 0.0  # 正在使用，重置空闲计时
@@ -91,9 +100,9 @@ class EventManager:
             await self._session.close()
             self._session = None
 
-    def subscribe(self, callback_url: str, timeout: int = 1800) -> str | None:
+    async def subscribe(self, callback_url: str, timeout: int = 1800) -> str | None:
         """创建新订阅; CALLBACK 非法或订阅表满时返回 None (调用方回 400)"""
-        url = validate_callback_url(callback_url)
+        url = await validate_callback_url(callback_url)
         if url is None:
             log.warning(f"拒绝非法 CALLBACK 订阅: {callback_url[:80]}")
             return None
@@ -162,6 +171,7 @@ class EventManager:
                 sub.callback_url,
                 headers=headers,
                 data=event_xml,
+                allow_redirects=False,
             ):
                 pass
         except Exception:

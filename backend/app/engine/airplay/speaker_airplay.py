@@ -11,6 +11,7 @@ import time
 from zeroconf import Zeroconf, IPVersion
 
 from app.engine.airplay.server import AirPlayServer
+from app.engine.audio_stream import with_cache_buster
 from app.engine.speaker import SpeakerController
 
 log = logging.getLogger("miair")
@@ -281,8 +282,7 @@ class SpeakerAirPlay:
                 return
         if not self._airplay_active or self._stream_url != stream_url:
             return
-        base_url = stream_url.split('?')[0]
-        fresh_url = f"{base_url}?sid={int(time.time())}"
+        fresh_url = with_cache_buster(stream_url)
         log.warning(f"AirPlay 补发后音箱未拉流，换新 URL 重试: {fresh_url} ({self.device_name})")
         await self.controller.play_url(fresh_url, audio_id)
 
@@ -389,8 +389,7 @@ class SpeakerAirPlay:
                         break
 
                     # 重新播放（使用新 URL 防止音箱缓存旧响应，复用本会话的 audioID）
-                    base_url = self._stream_url.split('?')[0]
-                    fresh_url = f"{base_url}?sid={int(time.time())}"
+                    fresh_url = with_cache_buster(self._stream_url)
                     log.info(f"[{self.device_name}] AirPlay 自动续播: {fresh_url}")
                     self._play_grace_until = time.time() + 10.0
                     success = await self.controller.play_url(fresh_url, self._session_audio_id)

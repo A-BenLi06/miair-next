@@ -57,6 +57,25 @@ class TestSetup:
         resp = _setup_admin(username="hacker", password="evil12345")
         assert resp.status_code == 400
 
+    def test_concurrent_first_admin_creation_is_atomic(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(
+                pool.map(
+                    lambda item: store.create_initial_user(*item),
+                    [
+                        ("admin-a", "hash-a"),
+                        ("admin-b", "hash-b"),
+                    ],
+                )
+            )
+
+        assert sum(results) == 1
+        assert store.is_initialized()
+        with sqlite3.connect(get_settings().db_path) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 1
+
 
 class TestLogin:
     def test_login_success(self):
@@ -297,6 +316,10 @@ class TestPasswordStrength:
     def test_setup_accepts_mixed_password(self):
         resp = _setup_admin(password="pass1234")
         assert resp.status_code == 200
+
+    def test_setup_rejects_password_over_bcrypt_byte_limit(self):
+        resp = _setup_admin(password="a" * 72 + "1")
+        assert resp.status_code == 422
 
     def test_change_password_rejects_weak_new_password(self):
         token = _setup_admin().json()["access_token"]

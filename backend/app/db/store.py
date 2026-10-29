@@ -75,6 +75,28 @@ def create_user(username: str, password_hash: str) -> bool:
             return False
 
 
+def create_initial_user(username: str, password_hash: str) -> bool:
+    """原子创建首个管理员，确保并发首次设置只能成功一次。
+
+    ``is_initialized`` 与普通 INSERT 分开执行会留出竞态：两个首次设置请求
+    可以同时通过检查并使用不同用户名创建两个账号。BEGIN IMMEDIATE 先取得
+    SQLite 写锁，再在同一事务内检查和插入；多进程部署下也由 SQLite 保证串行。
+    """
+    with _lock, _connect() as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT 1 FROM users LIMIT 1").fetchone()
+            if row is not None:
+                return False
+            conn.execute(
+                "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+                (username, password_hash),
+            )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
 def get_password_hash(username: str) -> str | None:
     with _lock, _connect() as conn:
         row = conn.execute(

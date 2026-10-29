@@ -8,7 +8,7 @@ import socket
 import time
 
 from app.core.config import get_settings
-from app.engine.audio_stream import AudioStreamServer
+from app.engine.audio_stream import AudioStreamServer, with_cache_buster
 from app.engine.speaker import SpeakerController
 from app.engine.spotify.pulse import PulseAudio
 from app.engine.spotify.soloist import (
@@ -36,10 +36,10 @@ def _free_port() -> int:
 
 
 def _fresh_stream_url(url: str) -> str:
-    """附加时间戳防止音箱拉取旧缓存"""
+    """附加独立缓存键，不替换音频流会话令牌。"""
     if not url:
         return url
-    return f"{url.split('?')[0]}?sid={int(time.time())}"
+    return with_cache_buster(url)
 
 
 class SpotifyReceiver:

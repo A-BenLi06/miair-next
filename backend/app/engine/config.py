@@ -17,6 +17,7 @@ _SENSITIVE_FIELDS = (
     "account",
     "password",
     "cookie",
+    "notify_feishu_webhook",
     "spotify_api_key",
     "notify_feishu_secret",
     "notify_wxpusher_spt",

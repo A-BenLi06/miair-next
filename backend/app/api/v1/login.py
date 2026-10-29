@@ -65,8 +65,10 @@ async def setup_admin(payload: SetupRequest):
     # 都必须移入线程池, 否则登录瞬间会卡住事件循环上的
     # WS 状态推送与 DLNA 事件回调
     hashed = await asyncio.to_thread(hash_password, payload.password)
-    if not await asyncio.to_thread(store.create_user, payload.username, hashed):
-        raise HTTPException(status_code=400, detail="创建管理员失败")
+    if not await asyncio.to_thread(
+        store.create_initial_user, payload.username, hashed
+    ):
+        raise HTTPException(status_code=400, detail="管理员已初始化或创建失败")
     return TokenResponse(access_token=create_access_token(payload.username))
 
 

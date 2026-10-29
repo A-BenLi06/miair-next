@@ -1,16 +1,4 @@
-"""版本号一致性校验
-
-docs/development.md 要求「发版时必须同步修改两处」:
-    backend/app/engine/const.py  的 VERSION
-    backend/pyproject.toml       的 version
-
-这条约定此前只靠人工记忆, 漏改会导致:
-- 面板「检查更新」拿 pyproject 版本与 GitHub Release 比较, 误报/漏报新版本
-- 镜像内 `python -c "import app; print(app.__version__)"` 与包元数据不一致
-
-本测试把约定固化为 CI 关卡。其余版本号 (前端 package.json、fnOS、iStore)
-是各自渠道独立的发版号, 不要求与后端一致, 仅在此处记录现状以便追溯。
-"""
+"""确保应用在后端、前端和各打包渠道使用同一发布版本。"""
 
 import re
 import sys
@@ -64,20 +52,14 @@ def test_version_is_semver():
     "relative_path,pattern,label",
     [
         ("frontend/package.json", r'"version"\s*:\s*"([^"]+)"', "前端"),
+        ("frontend/package-lock.json", r'^\s*"version"\s*:\s*"([^"]+)"', "前端 lockfile"),
         ("fnos/manifest", r"^version\s*=\s*([\d.]+)", "fnOS"),
-        ("istore/app-meta-miair-next/Makefile", r"^PKG_VERSION:=([\d.]+)", "iStore"),
+        ("istore/app-meta-miair-next/Makefile", r"^PKG_VERSION:=([\d.]+)", "iStore meta"),
+        ("istore/luci-app-miair-next/Makefile", r"^PKG_VERSION:=([\d.]+)", "iStore LuCI"),
     ],
 )
-def test_channel_versions_present_and_parseable(relative_path, pattern, label):
-    """各发行渠道的版本号必须存在且可解析
-
-    这些渠道有独立的发版节奏 (iStore 的 PKG_RELEASE 还是日期编号), 因此
-    只校验「存在且格式正确」, 不强制与后端一致 —— 但要能机械读取, 避免
-    渠道包用着早已废弃的版本号却无人发现。
-
-    文件缺失按失败处理 (不用 pytest.skip): 否则在只 checkout 了 backend/
-    的环境里会静默跳过, 让这道关卡形同虚设。
-    """
+def test_channel_versions_match_release(relative_path, pattern, label):
+    """所有发布渠道的应用版本号必须与后端版本一致。"""
     path = REPO_ROOT / relative_path
     assert path.is_file(), (
         f"{label} 配置文件缺失: {relative_path}; "
@@ -85,6 +67,6 @@ def test_channel_versions_present_and_parseable(relative_path, pattern, label):
     )
     match = re.search(pattern, path.read_text(encoding="utf-8"), re.M)
     assert match, f"{label} 版本号无法从 {relative_path} 解析"
-    assert re.fullmatch(r"\d+\.\d+(\.\d+)?", match.group(1)), (
-        f"{label} 版本号格式异常: {match.group(1)}"
+    assert match.group(1) == _const_version(), (
+        f"{label} 版本号与后端不一致: {match.group(1)} vs {_const_version()}"
     )

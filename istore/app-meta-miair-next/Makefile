@@ -2,8 +2,8 @@
 
 include $(TOPDIR)/rules.mk
 
-PKG_VERSION:=1.0.3
-PKG_RELEASE:=20260821
+PKG_VERSION:=0.9.1
+PKG_RELEASE:=20261029
 META_TITLE:=MiAir Next
 META_TITLE.en:=MiAir Next
 META_DEPENDS:=+luci-app-miair-next +luci-i18n-miair-next-zh-cn +docker-deps

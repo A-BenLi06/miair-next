@@ -70,6 +70,63 @@ def test_recovery_skipped_when_dlna_already_running():
     assert calls == []
 
 
+def test_recovery_callback_does_not_restart_during_initial_startup():
+    orch = _bare_orchestrator()
+    calls: list = []
+    _attach_recorder(orch, calls)
+
+    async def run():
+        orch._startup_task = asyncio.create_task(asyncio.sleep(60))
+        await orch._on_auth_recovered()
+        assert calls == []
+        orch._startup_task.cancel()
+        await asyncio.gather(orch._startup_task, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_start_does_not_wait_for_cloud_initialization_and_stop_cancels_it():
+    """Web lifespan 应快速启动；关闭时取消未完成的云端初始化。"""
+    orch = Orchestrator.__new__(Orchestrator)
+    orch.config = SimpleNamespace(
+        hostname="127.0.0.1",
+        dlna_port=8200,
+        account="user",
+        cookie="",
+        mi_did="did-1",
+    )
+    orch._restart_lock = asyncio.Lock()
+    orch._startup_task = None
+    orch._device_check_task = None
+    orch.airplay_manager = None
+    orch.auth = SimpleNamespace(close=lambda: asyncio.sleep(0))
+    init_started = asyncio.Event()
+
+    async def blocked_startup():
+        init_started.set()
+        await asyncio.Future()
+
+    async def stop_dlna():
+        return None
+
+    async def stop_spotify():
+        return None
+
+    orch._start_dlna_services = blocked_startup
+    orch._stop_dlna_services = stop_dlna
+    orch._stop_spotify = stop_spotify
+
+    async def run():
+        await asyncio.wait_for(orch.start(), timeout=0.1)
+        startup_task = orch._startup_task
+        await asyncio.wait_for(init_started.wait(), timeout=0.1)
+        await orch.stop()
+        assert startup_task.cancelled()
+        assert orch._startup_task is None
+
+    asyncio.run(run())
+
+
 def test_start_spotify_defers_when_target_offline():
     """启动时目标音箱离线应等待上线"""
     orch = Orchestrator.__new__(Orchestrator)

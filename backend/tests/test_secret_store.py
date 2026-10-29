@@ -55,6 +55,7 @@ class TestConfigEncryptionIntegration:
             account="13800000000",
             password="mi-pass-123",
             cookie="userId=1; passToken=abc",
+            notify_feishu_webhook="https://open.feishu.cn/hook/secret-token",
             spotify_api_key="spotify-key",
         )
         cfg.save()
@@ -65,6 +66,7 @@ class TestConfigEncryptionIntegration:
             ("account", "13800000000"),
             ("password", "mi-pass-123"),
             ("cookie", "passToken=abc"),
+            ("notify_feishu_webhook", "https://open.feishu.cn/hook/secret-token"),
             ("spotify_api_key", "spotify-key"),
         ):
             assert data[field].startswith("enc:v1:")
@@ -78,6 +80,7 @@ class TestConfigEncryptionIntegration:
             account="13800000000",
             password="mi-pass-123",
             cookie="userId=1; passToken=abc",
+            notify_feishu_webhook="https://open.feishu.cn/hook/secret-token",
             spotify_api_key="spotify-key",
         )
         cfg.save()
@@ -86,6 +89,7 @@ class TestConfigEncryptionIntegration:
         assert loaded.account == "13800000000"
         assert loaded.password == "mi-pass-123"
         assert loaded.cookie == "userId=1; passToken=abc"
+        assert loaded.notify_feishu_webhook == "https://open.feishu.cn/hook/secret-token"
         assert loaded.spotify_api_key == "spotify-key"
 
     def test_legacy_plaintext_config_upgrades_on_save(self, tmp_path):

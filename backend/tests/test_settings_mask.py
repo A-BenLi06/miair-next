@@ -1,6 +1,13 @@
 """cookie 脱敏 / 还原逻辑测试 (core/masking.py)"""
 
-from app.core.masking import MASKED_TOKEN, mask_cookie, mask_devices, unmask_cookie
+from app.core.masking import (
+    MASKED_TOKEN,
+    mask_cookie,
+    mask_devices,
+    mask_secret,
+    unmask_cookie,
+    unmask_secret,
+)
 
 REAL_COOKIE = "userId=123456789; passToken=SecretTokenValue; deviceId=dev01"
 
@@ -82,3 +89,17 @@ class TestMaskDevices:
     def test_missing_field_skipped(self):
         masked = mask_devices([{"name": "只有名字"}])
         assert masked == [{"name": "只有名字"}]
+
+
+class TestMaskWebhookSecret:
+    def test_webhook_masked_and_unchanged_value_restored(self):
+        webhook = "https://open.feishu.cn/hook/very-secret-token"
+        masked = mask_secret(webhook)
+        assert "very-secret-token" not in masked
+        assert unmask_secret(masked, webhook) == webhook
+
+    def test_replacement_and_clear_are_preserved(self):
+        assert unmask_secret("https://example.test/new", "old-webhook") == (
+            "https://example.test/new"
+        )
+        assert unmask_secret("", "old-webhook") == ""

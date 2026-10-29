@@ -16,6 +16,7 @@ import socket
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
+from aiohttp.abc import AbstractResolver
 
 # 允许的 URL 协议
 ALLOWED_SCHEMES = ("http", "https")
@@ -49,12 +50,56 @@ def _is_blocked_ip(ip_str: str) -> bool:
         ip = ipaddress.ip_address(ip_str)
     except ValueError:
         return True  # 解析失败按危险处理
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return _is_blocked_ip(str(ip.ipv4_mapped))
     return (
         ip.is_loopback        # 127.0.0.0/8, ::1
         or ip.is_link_local   # 169.254.0.0/16 (含云 metadata), fe80::/10
         or ip.is_unspecified  # 0.0.0.0, ::
         or ip.is_multicast    # 224.0.0.0/4
     )
+
+
+class SafeResolver(AbstractResolver):
+    """在 aiohttp 实际解析连接地址时复核 IP，避免 DNS 校验与连接间重绑定。"""
+
+    async def _lookup(self, host: str, port: int, family: int):
+        loop = asyncio.get_running_loop()
+        return await loop.getaddrinfo(
+            host,
+            port,
+            family=family,
+            type=socket.SOCK_STREAM,
+            proto=socket.IPPROTO_TCP,
+        )
+
+    async def resolve(self, host: str, port: int = 0, family: int = socket.AF_INET):
+        try:
+            infos = await self._lookup(host, port, family)
+        except (socket.gaierror, UnicodeError) as e:
+            raise UnsafeURLError(f"主机解析失败: {host} ({e})") from e
+        if not infos:
+            raise UnsafeURLError(f"主机解析失败: {host}")
+
+        resolved = []
+        for af, socktype, proto, _canon, sockaddr in infos:
+            address = sockaddr[0]
+            if _is_blocked_ip(address):
+                raise UnsafeURLError(f"目标地址不允许访问: {address}")
+            resolved.append(
+                {
+                    "hostname": host,
+                    "host": address,
+                    "port": port,
+                    "family": af,
+                    "proto": proto,
+                    "flags": 0,
+                }
+            )
+        return resolved
+
+    async def close(self) -> None:
+        return None
 
 
 def assert_host_safe(hostname: str) -> None:
